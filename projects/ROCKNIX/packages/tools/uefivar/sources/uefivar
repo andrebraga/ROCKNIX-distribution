@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+uefivar - Direct block-device read/write for Qualcomm UEFI variables.
+
+Bypasses uefisecapp trustlet by parsing PTBL -> DStr -> VAR2 structure
+directly. Non-authenticated variables (attrs bit 0x20 clear) can be freely
+modified: CRC32 must be updated, HMAC field is zeroed (trustlet accepts
+zero without regenerating).
+
+Structure (proven by RE, Odin 3 / uefi.lnx.5.0.r39-rel):
+  Partition starts with PTBL magic + 16-byte directory entries.
+  Each entry points to a sub-partition holding N DStr slots.
+  DStr layout (0x30 bytes header):
+    +0x00: "DStr" magic
+    +0x04: 12 bytes version/format
+    +0x10: gen counter (u32)
+    +0x14: CRC32 of covered VAR2 segment (u32)
+    +0x18: 16 bytes reserved
+    +0x28: HMAC (u32; zero -> trustlet regenerates on write)
+  VAR2 layout:
+    +0x00: "VAR2" magic + 4 version bytes
+    +0x08: total segment size (u32)
+    +0x0c: segment state (u32)
+    +0x10: attrs (u32)
+    +0x14: record size (u32)
+    +0x18: VendorGuid (16B)
+    +0x28: metadata (12B)
+    +0x34: data_len (u32)
+    +0x38: name_len (u16)
+    +0x3a: name (UTF-16, name_len bytes)
+    +0x3a+name_len: data (data_len bytes)
+"""
+import argparse, os, struct, sys, time, zlib
+
+DEFAULT_PART = "/dev/disk/by-partlabel/uefivarstore"
+PART_SIZE = 0x80000  # 512 KB
+
+# Known variable locations on SM8750/Odin3 (as RE'd)
+RTCINFO_GUID = bytes.fromhex('2b8c2f8846965f438de5f208ff80c1bd')
+# The slots we care about (both mirrored for redundancy)
+RTCINFO_SLOTS = [
+    # (HDR_off, FTR_off, VAR2_off, data_off_inside_var2, data_len)
+    (0x66000, 0x6c000, 0x67000, 0x6704a, 0x0c),  # gen 654 slot
+    (0x6d000, 0x73000, 0x6e000, 0x6e04a, 0x0c),  # gen 655 slot (current)
+]
+GPS_EPOCH = 315964800   # 1980-01-06 UTC
+
+# ---------- low-level partition helpers ----------
+
+def read_partition(path):
+    with open(path, 'rb') as f:
+        d = f.read(PART_SIZE)
+    if len(d) != PART_SIZE:
+        raise IOError(f'expected {PART_SIZE} bytes, got {len(d)}')
+    return bytearray(d)
+
+def write_partition(path, data):
+    if len(data) != PART_SIZE:
+        raise ValueError('partition size mismatch')
+    # write to a temp file first, then dd? For a raw block device use O_DIRECT-less
+    fd = os.open(path, os.O_WRONLY | os.O_SYNC)
+    try:
+        os.pwrite(fd, bytes(data), 0)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def recompute_slot(data, slot):
+    """After modifying VAR2 payload in slot, recompute CRC1 in HDR+FTR
+    and zero HMAC in HDR+FTR. Returns new CRC1."""
+    hdr, ftr, var2, _, _ = slot
+    seg_size = struct.unpack_from('<I', data, var2+8)[0]
+    if seg_size == 0 or seg_size > 0x8000:
+        raise ValueError(f'bad VAR2 seg_size={seg_size:#x}')
+    crc = zlib.crc32(bytes(data[var2:var2+seg_size])) & 0xffffffff
+    struct.pack_into('<I', data, hdr+0x14, crc)
+    struct.pack_into('<I', data, ftr+0x14, crc)
+    struct.pack_into('<I', data, hdr+0x28, 0)
+    struct.pack_into('<I', data, ftr+0x28, 0)
+    return crc
+
+def get_current_slot(data):
+    """Return the slot with the highest gen counter (the 'current' one)."""
+    slots = sorted(RTCINFO_SLOTS,
+                   key=lambda s: -struct.unpack_from('<I', data, s[0]+0x10)[0])
+    return slots[0]
+
+# ---------- RTC-specific ----------
+
+def rtc_read_raw_pmic():
+    """Read raw PMIC RTC counter from /sys."""
+    try:
+        with open('/sys/class/rtc/rtc0/since_epoch') as f:
+            return int(f.read().strip())
+    except (IOError, ValueError):
+        # If ROCKNIX SDAM/UEFI offset isn't zero, since_epoch = raw + offset
+        # For now assume raw. Better: read PMIC counter regs directly via SPMI.
+        return 0
+
+def cmd_rtc_get(args):
+    data = read_partition(args.partition)
+    slot = get_current_slot(data)
+    hdr, ftr, var2, data_off, _ = slot
+    offset_gps = struct.unpack_from('<I', data, data_off)[0]
+    reserved   = bytes(data[data_off+4:data_off+12])
+    unix_off   = offset_gps + GPS_EPOCH
+    raw_pmic   = rtc_read_raw_pmic()
+    wall       = unix_off + raw_pmic
+    hdr_gen    = struct.unpack_from('<I', data, hdr+0x10)[0]
+    if not args.set_system_clock:
+        print(f'slot          : gen {hdr_gen} @ HDR {hdr:#x} / VAR2 {var2:#x}')
+        print(f'offset_gps    : 0x{offset_gps:08x} = {offset_gps}')
+        print(f'unix offset   : {unix_off}')
+        print(f'reserved[8]   : {reserved.hex()}')
+        if args.include_counter:
+            print(f'raw_pmic      : {raw_pmic}')
+            print(f'wall time     : {wall}  = {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(wall))}')
+        return
+
+    # --- set system clock from UEFI value ---
+    if offset_gps == 0:
+        print('offset_gps is 0 (uninitialised); not touching system clock', file=sys.stderr)
+        return
+    if raw_pmic == 0:
+        print('raw PMIC counter unavailable; not touching system clock', file=sys.stderr)
+        sys.exit(1)
+    # Sanity: don't jump backward if system time already looks correct + newer
+    sys_now = int(time.time())
+    if sys_now > wall + 60 and sys_now > 1700000000:
+        print(f'system time ({sys_now}) already ahead of UEFI ({wall}); not clobbering', file=sys.stderr)
+        return
+    # Set clock via clock_settime(CLOCK_REALTIME, ts)
+    import ctypes, ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+    class Timespec(ctypes.Structure):
+        _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+    ts = Timespec(wall, 0)
+    CLOCK_REALTIME = 0
+    if libc.clock_settime(CLOCK_REALTIME, ctypes.byref(ts)) != 0:
+        err = ctypes.get_errno()
+        print(f'clock_settime failed: errno={err} ({os.strerror(err)})', file=sys.stderr)
+        sys.exit(1)
+    print(f'system clock set to {wall} ({time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(wall))})')
+
+def cmd_rtc_set(args):
+    """Set RTCInfo so that wall = raw_pmic + offset_gps + GPS_EPOCH = target_unix.
+    target_unix defaults to current system time (assumed correct)."""
+    target = int(args.target) if args.target != 'now' else int(time.time())
+    raw_pmic = rtc_read_raw_pmic()
+    new_offset_gps = target - raw_pmic - GPS_EPOCH
+    if not (0 <= new_offset_gps < 2**32):
+        raise ValueError(f'offset_gps out of range: {new_offset_gps}')
+    print(f'target unix   : {target}  ({time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(target))})')
+    print(f'raw_pmic      : {raw_pmic}')
+    print(f'new offset_gps: 0x{new_offset_gps:08x} = {new_offset_gps}')
+
+    if args.dry_run:
+        print('(dry run — no write)')
+        return
+
+    data = read_partition(args.partition)
+    for slot in RTCINFO_SLOTS:
+        hdr, ftr, var2, data_off, _ = slot
+        old = struct.unpack_from('<I', data, data_off)[0]
+        struct.pack_into('<I', data, data_off, new_offset_gps)
+        crc = recompute_slot(data, slot)
+        print(f'  slot HDR {hdr:#x}: offset_gps {old:#010x}->{new_offset_gps:#010x}, CRC1={crc:#010x}, HMAC=0')
+    write_partition(args.partition, data)
+    print('wrote partition.')
+
+def cmd_dump(args):
+    """Dump PTBL directory + all DStr slots + all VAR2 segments."""
+    data = read_partition(args.partition)
+    magic, ver, x1, n = struct.unpack_from('<4sHHI', data, 0)
+    print(f'PTBL magic={magic!r} ver={ver:#x} f0={x1:#x} n={n}')
+    for i in range(min(n, 16)):
+        t, o, s = struct.unpack_from('<IHH', data, 0x10 + i*16)
+        if t == 0: continue
+        print(f'  entry {i}: type={t:#x} @ {o*0x1000:#x} size={s*0x1000:#x}')
+
+    print('\n=== DStr slots + generation ===')
+    for base in [0x1000, 0x17000, 0x18000, 0x2e000, 0x66000, 0x6c000, 0x6d000, 0x73000]:
+        if data[base:base+4] == b'DStr':
+            gen  = struct.unpack_from('<I', data, base+0x10)[0]
+            crc1 = struct.unpack_from('<I', data, base+0x14)[0]
+            hmac = struct.unpack_from('<I', data, base+0x28)[0]
+            print(f'  DStr @ {base:#08x}: gen={gen:6}  CRC1=0x{crc1:08x}  HMAC=0x{hmac:08x}')
+
+    print('\n=== VAR2 segments + records ===')
+    i = 0x1000
+    while i < len(data) - 4:
+        if data[i:i+4] == b'VAR2':
+            seg_size = struct.unpack_from('<I', data, i+8)[0]
+            if 0 < seg_size < 0x8000:
+                crc = zlib.crc32(bytes(data[i:i+seg_size])) & 0xffffffff
+                # decode first record's name
+                attrs = struct.unpack_from('<I', data, i+0x10)[0]
+                data_len = struct.unpack_from('<I', data, i+0x34)[0]
+                name_len = struct.unpack_from('<H', data, i+0x38)[0]
+                if 0 < name_len < 0x40:
+                    name_bytes = data[i+0x3a:i+0x3a+name_len]
+                    try:
+                        name = name_bytes.decode('utf-16le').rstrip('\0')
+                    except Exception:
+                        name = f'<{name_bytes.hex()}>'
+                    guid = data[i+0x18:i+0x28].hex()
+                    print(f'  VAR2 @ {i:#08x} size={seg_size:#5x} attrs={attrs:#04x} '
+                          f'name="{name}" data_len={data_len} guid={guid} crc32={crc:#010x}')
+            i += max(seg_size if 0 < seg_size < 0x1000 else 0x100, 0x100)
+        else:
+            i += 4
+
+# ---------- main ----------
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split('\n')[1])
+    p.add_argument('-p', '--partition', default=DEFAULT_PART,
+                   help='block device / file path (default %(default)s)')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    d = sub.add_parser('dump', help='dump partition structure')
+    d.set_defaults(func=cmd_dump)
+
+    g = sub.add_parser('rtc-get', help='read RTCInfo offset_gps')
+    g.add_argument('--include-counter', action='store_true',
+                   help='also read /sys rtc0 counter and compute wall time')
+    g.add_argument('--set-system-clock', action='store_true',
+                   help='set CLOCK_REALTIME from decoded UEFI RTCInfo (boot use)')
+    g.set_defaults(func=cmd_rtc_get)
+
+    s = sub.add_parser('rtc-set', help='set RTCInfo to make wall time match target')
+    s.add_argument('target', help='unix timestamp or "now"')
+    s.add_argument('--dry-run', action='store_true')
+    s.set_defaults(func=cmd_rtc_set)
+
+    args = p.parse_args()
+    return args.func(args)
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)

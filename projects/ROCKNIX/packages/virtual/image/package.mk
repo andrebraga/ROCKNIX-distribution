@@ -87,6 +87,11 @@ fi
 # Installer support
 [ "${INSTALLER_SUPPORT}" = "yes" ] && PKG_DEPENDS_TARGET+=" installer"
 
+# uefivar: SSOT for time via UEFI variables on Qualcomm SM* devices.
+# Reads/writes the uefivarstore partition directly, bypassing the qseecom
+# trustlet gate. Shared with Android for Android<->Linux RTC sync.
+[ "${DEVICE:0:2}" = "SM" ] && PKG_DEPENDS_TARGET+=" uefivar"
+
 # Devtools... (not for Release)
 [ "${TESTING}" = "yes" ] && PKG_DEPENDS_TARGET+=" testing"
 
