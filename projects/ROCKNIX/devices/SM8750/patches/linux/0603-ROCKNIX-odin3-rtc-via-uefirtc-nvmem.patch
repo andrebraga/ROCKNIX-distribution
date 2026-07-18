@@ -1,0 +1,589 @@
+Subject: [PATCH] SM8750: RTC via uefivarstore nvmem (Android-shared SSOT)
+
+Add drivers/nvmem/qcom-uefirtc which exposes the RTC offset stored in
+the RTCInfo UEFI variable (uefivarstore partition) as an nvmem cell,
+backed by direct block-device reads/writes.  rtc-pm8xxx binds via its
+existing "offset" cell binding, so no changes to the RTC driver are
+required.  The data is shared with Android, which reaches the same
+partition through its qseecom uefisecapp trustlet.
+
+Kernel-side layers peeled: no userspace tool required, no trustlet
+loader, no allowlist gate.  The nvmem provider defers probe until the
+partition device is enumerated (~1.5 s), then rtc-pm8xxx applies the
+offset at HCTOSYS.  On write (hwclock -w / clock set), we recompute
+CRC-32 of the modified slot's VAR2 segment, bump generation, alternate
+to the copy-on-write spare slot, and zero the HMAC field so the
+trustlet accepts and regenerates on next read.
+---
+--- a/drivers/nvmem/Kconfig
++++ b/drivers/nvmem/Kconfig
+@@ -483,4 +483,15 @@ config NVMEM_QORIQ_EFUSE
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called nvmem_qoriq_efuse.
+ 
++
++config NVMEM_QCOM_UEFIRTC
++	tristate "Qualcomm UEFI variable store RTC nvmem"
++	depends on ARCH_QCOM || COMPILE_TEST
++	select CRC32
++	help
++	  Expose the RTC offset stored in the Qualcomm UEFI variable
++	  store partition (uefivarstore) as an nvmem cell. Used by
++	  rtc-pm8xxx to persist wall-clock time across reboots, shared
++	  with Android through the same block device.
++
+ endif
+
+--- a/drivers/nvmem/Makefile
++++ b/drivers/nvmem/Makefile
+@@ -95,3 +95,5 @@ obj-$(CONFIG_NVMEM_ZYNQMP)		+= nvmem_zynqmp_nvmem.o
+ nvmem_zynqmp_nvmem-y			:= zynqmp_nvmem.o
+ obj-$(CONFIG_NVMEM_QORIQ_EFUSE)		+= nvmem-qoriq-efuse.o
+ nvmem-qoriq-efuse-y			:= qoriq-efuse.o
++obj-$(CONFIG_NVMEM_QCOM_UEFIRTC)		+= nvmem_qcom_uefirtc.o
++nvmem_qcom_uefirtc-y			:= qcom-uefirtc.o
+
+--- /dev/null
++++ b/drivers/nvmem/qcom-uefirtc.c
+@@ -0,0 +1,512 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Qualcomm UEFI variable-store RTC-offset nvmem provider
++ *
++ * On Qualcomm devices whose firmware persists the wall-clock offset in a
++ * UEFI variable ("RTCInfo", GUID 882f8c2b-9646-435f-8de5-f208ff80c1bd)
++ * inside the uefivarstore partition, this driver reads and writes the
++ * offset directly from the block device.  It exposes a single 4-byte
++ * nvmem cell "offset" that rtc-pm8xxx binds via its existing
++ * nvmem-cell-names = "offset" property, so no changes to the RTC driver
++ * are required.
++ *
++ * On-disk layout was reverse-engineered from a live SM8750/AYN Odin 3
++ * device (uefi.lnx.5.0.r39-rel): a Qualcomm "PTBL" wrapper contains
++ * "DStr" (data-store) headers, each pointing to a "VAR2" segment.  The
++ * DStr header carries a plain CRC-32 (IEEE-802.3) of the covered VAR2
++ * segment and a truncated HMAC field.  The trustlet accepts a zero HMAC
++ * on read without regenerating it or rejecting the store (`WARN: S dev
++ * HMAC=0. Reinit` logic in the trustlet), so we compute a correct CRC
++ * and clear the HMAC field.  The variable is non-authenticated (attrs
++ * 0x07 == NV|BS|RT), so no signature is required.
++ *
++ * Write policy (deferred flush): writes from rtc-pm8xxx (settimeofday,
++ * hwclock -w, adjtimex step, ...) update an in-memory cache and mark it
++ * dirty; NAND is NOT touched.  The read-modify-write to the partition
++ * happens only from the reboot notifier (SYS_RESTART / SYS_POWER_OFF /
++ * SYS_HALT) or the PM notifier (PM_SUSPEND_PREPARE /
++ * PM_HIBERNATION_PREPARE).  This suppresses write amplification from
++ * runtime NTP corrections (which would otherwise burn one COW cycle per
++ * step) while still persisting across clean power events.  An unclean
++ * poweroff loses only the last runtime correction; the PMIC counter is
++ * silicon and always-on, and NTP re-establishes the offset on the next
++ * boot.
++ *
++ * Copyright (C) 2026 ROCKNIX
++ */
++
++#include <linux/blkdev.h>
++#include <linux/crc32.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/mod_devicetable.h>
++#include <linux/mutex.h>
++#include <linux/nvmem-provider.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reboot.h>
++#include <linux/slab.h>
++#include <linux/suspend.h>
++
++#define UEFIRTC_PART_SIZE	0x80000
++
++/* Two mirrored slots forming a copy-on-write journal.  The reader picks
++ * the slot with the higher generation counter; the writer alternates to
++ * the other slot with a bumped counter (see uefirtc_disk_write_offset). */
++#define UEFIRTC_SLOT1_VAR2	0x67000
++#define UEFIRTC_SLOT1_VAR2_LEN	0x214
++#define UEFIRTC_SLOT1_HDR_GEN	0x66010
++#define UEFIRTC_SLOT1_HDR_CRC	0x66014
++#define UEFIRTC_SLOT1_HDR_HMAC	0x66028
++#define UEFIRTC_SLOT1_FTR_GEN	0x6c010
++#define UEFIRTC_SLOT1_FTR_CRC	0x6c014
++#define UEFIRTC_SLOT1_FTR_HMAC	0x6c028
++#define UEFIRTC_SLOT1_OFFSET_GPS 0x6704a
++
++#define UEFIRTC_SLOT2_VAR2	0x6e000
++#define UEFIRTC_SLOT2_VAR2_LEN	0x214
++#define UEFIRTC_SLOT2_HDR_GEN	0x6d010
++#define UEFIRTC_SLOT2_HDR_CRC	0x6d014
++#define UEFIRTC_SLOT2_HDR_HMAC	0x6d028
++#define UEFIRTC_SLOT2_FTR_GEN	0x73010
++#define UEFIRTC_SLOT2_FTR_CRC	0x73014
++#define UEFIRTC_SLOT2_FTR_HMAC	0x73028
++#define UEFIRTC_SLOT2_OFFSET_GPS 0x6e04a
++
++/* rtc-pm8xxx's nvmem-cell code path treats the cell value as a full Unix
++ * time offset (equivalent to what SDAM stores). RTCInfo on disk stores
++ * an offset relative to the GPS epoch (1980-01-06). Translate on the fly
++ * so Android (which reads/writes the raw offset_gps via the trustlet)
++ * remains compatible while rtc-pm8xxx gets the value in the form it
++ * expects. Same value the UEFI-native path (qcom,uefi-rtc-info) uses.
++ */
++#define UEFIRTC_GPS_EPOCH	315964800u  /* 1980-01-06 UTC, Unix seconds */
++
++struct uefirtc {
++	struct device		*dev;
++	struct nvmem_device	*nvmem;
++	struct mutex		lock;
++	const char		*part_path;
++
++	/* Deferred-write cache. */
++	u32			cached_gps;
++	bool			cached_valid;
++	bool			dirty;
++
++	struct notifier_block	reboot_nb;
++	struct notifier_block	pm_nb;
++};
++
++static struct file *uefirtc_open(struct uefirtc *u, blk_mode_t mode)
++{
++	return bdev_file_open_by_path(u->part_path, mode, u, NULL);
++}
++
++static int uefirtc_read_block(struct uefirtc *u, void *buf, loff_t off,
++			      size_t len)
++{
++	struct file *f;
++	ssize_t n;
++
++	f = uefirtc_open(u, BLK_OPEN_READ);
++	if (IS_ERR(f))
++		return PTR_ERR(f);
++
++	n = kernel_read(f, buf, len, &off);
++	fput(f);
++
++	if (n < 0)
++		return n;
++	return (n == len) ? 0 : -EIO;
++}
++
++static int uefirtc_write_block(struct uefirtc *u, const void *buf, loff_t off,
++			       size_t len)
++{
++	struct file *f;
++	ssize_t n;
++	int ret;
++
++	f = uefirtc_open(u, BLK_OPEN_READ | BLK_OPEN_WRITE);
++	if (IS_ERR(f))
++		return PTR_ERR(f);
++
++	n = kernel_write(f, buf, len, &off);
++	if (n >= 0)
++		vfs_fsync(f, 0);
++	ret = (n < 0) ? n : ((n == len) ? 0 : -EIO);
++	fput(f);
++	return ret;
++}
++
++/* Read raw offset_gps from the active slot (higher generation). */
++static int uefirtc_disk_read_offset(struct uefirtc *u, u32 *out_gps)
++{
++	__le32 gen1 = 0, gen2 = 0, off = 0;
++	loff_t addr;
++	int ret;
++
++	ret = uefirtc_read_block(u, &gen1, UEFIRTC_SLOT1_HDR_GEN, 4);
++	if (ret)
++		return ret;
++	ret = uefirtc_read_block(u, &gen2, UEFIRTC_SLOT2_HDR_GEN, 4);
++	if (ret)
++		return ret;
++
++	addr = (le32_to_cpu(gen2) >= le32_to_cpu(gen1)) ?
++		UEFIRTC_SLOT2_OFFSET_GPS : UEFIRTC_SLOT1_OFFSET_GPS;
++	ret = uefirtc_read_block(u, &off, addr, 4);
++	if (ret)
++		return ret;
++	*out_gps = le32_to_cpu(off);
++	return 0;
++}
++
++/* Copy-on-write flush: read partition, pick the SPARE slot (the one with
++ * the lower generation counter), overwrite it with the CURRENT slot's
++ * VAR2 payload patched with the new offset_gps, bump the SPARE slot's
++ * generation to max(cur_gen, spare_gen) + 1, recompute CRC-32 over the
++ * new VAR2 payload, zero HMAC.
++ *
++ * This preserves the vendor journal invariants:
++ *   - Two independent slots, only the higher-gen one is authoritative.
++ *   - Every write advances the generation counter monotonically, so a
++ *     concurrent Android trustlet reader sees our value as newer.
++ *   - The current slot is never touched, so a torn write leaves the
++ *     previous state fully intact and readable.
++ *
++ * VAR2 layout details other than offset_gps are copied verbatim from
++ * the current slot, so any per-boot vendor bookkeeping in that payload
++ * (name/GUID/attrs/reserved area) is inherited as-is. */
++static int uefirtc_disk_write_offset(struct uefirtc *u, u32 new_gps)
++{
++	__le32 offset_le = cpu_to_le32(new_gps);
++	__le32 new_gen_le;
++	__le32 zero = 0;
++	u32 gen1, gen2, new_gen;
++	loff_t src_var2, dst_var2;
++	loff_t dst_hdr_gen, dst_hdr_crc, dst_hdr_hmac;
++	loff_t dst_ftr_gen, dst_ftr_crc, dst_ftr_hmac;
++	loff_t dst_offset_gps;
++	u32 crc;
++	u8 *img;
++	int ret;
++
++	img = kmalloc(UEFIRTC_PART_SIZE, GFP_KERNEL);
++	if (!img)
++		return -ENOMEM;
++
++	ret = uefirtc_read_block(u, img, 0, UEFIRTC_PART_SIZE);
++	if (ret)
++		goto out;
++
++	gen1 = le32_to_cpup((__le32 *)(img + UEFIRTC_SLOT1_HDR_GEN));
++	gen2 = le32_to_cpup((__le32 *)(img + UEFIRTC_SLOT2_HDR_GEN));
++
++	if (gen2 >= gen1) {
++		/* Current = slot 2, spare = slot 1. */
++		src_var2       = UEFIRTC_SLOT2_VAR2;
++		dst_var2       = UEFIRTC_SLOT1_VAR2;
++		dst_offset_gps = UEFIRTC_SLOT1_OFFSET_GPS;
++		dst_hdr_gen    = UEFIRTC_SLOT1_HDR_GEN;
++		dst_hdr_crc    = UEFIRTC_SLOT1_HDR_CRC;
++		dst_hdr_hmac   = UEFIRTC_SLOT1_HDR_HMAC;
++		dst_ftr_gen    = UEFIRTC_SLOT1_FTR_GEN;
++		dst_ftr_crc    = UEFIRTC_SLOT1_FTR_CRC;
++		dst_ftr_hmac   = UEFIRTC_SLOT1_FTR_HMAC;
++		new_gen        = gen2 + 1;
++	} else {
++		/* Current = slot 1, spare = slot 2. */
++		src_var2       = UEFIRTC_SLOT1_VAR2;
++		dst_var2       = UEFIRTC_SLOT2_VAR2;
++		dst_offset_gps = UEFIRTC_SLOT2_OFFSET_GPS;
++		dst_hdr_gen    = UEFIRTC_SLOT2_HDR_GEN;
++		dst_hdr_crc    = UEFIRTC_SLOT2_HDR_CRC;
++		dst_hdr_hmac   = UEFIRTC_SLOT2_HDR_HMAC;
++		dst_ftr_gen    = UEFIRTC_SLOT2_FTR_GEN;
++		dst_ftr_crc    = UEFIRTC_SLOT2_FTR_CRC;
++		dst_ftr_hmac   = UEFIRTC_SLOT2_FTR_HMAC;
++		new_gen        = gen1 + 1;
++	}
++
++	/* Copy current VAR2 payload into the spare slot verbatim. */
++	memcpy(img + dst_var2, img + src_var2, UEFIRTC_SLOT1_VAR2_LEN);
++	/* Patch offset_gps in the spare copy. */
++	memcpy(img + dst_offset_gps, &offset_le, 4);
++
++	/* Bump generation in the spare slot's HDR and FTR mirrors. */
++	new_gen_le = cpu_to_le32(new_gen);
++	memcpy(img + dst_hdr_gen, &new_gen_le, 4);
++	memcpy(img + dst_ftr_gen, &new_gen_le, 4);
++
++	/* Recompute CRC-32 of the patched VAR2 payload. */
++	crc = crc32(0, img + dst_var2, UEFIRTC_SLOT1_VAR2_LEN);
++	memcpy(img + dst_hdr_crc, &crc, 4);
++	memcpy(img + dst_ftr_crc, &crc, 4);
++
++	/* Zero HMAC so the trustlet accepts the store and regenerates. */
++	memcpy(img + dst_hdr_hmac, &zero, 4);
++	memcpy(img + dst_ftr_hmac, &zero, 4);
++
++	ret = uefirtc_write_block(u, img, 0, UEFIRTC_PART_SIZE);
++out:
++	kfree(img);
++	return ret;
++}
++
++/* Flush the cache to disk if dirty. */
++static int uefirtc_flush(struct uefirtc *u)
++{
++	bool need_flush = false;
++	u32 gps_to_write = 0;
++	int ret;
++
++	mutex_lock(&u->lock);
++	if (u->cached_valid && u->dirty) {
++		need_flush = true;
++		gps_to_write = u->cached_gps;
++	}
++	mutex_unlock(&u->lock);
++
++	if (!need_flush)
++		return 0;
++
++	ret = uefirtc_disk_write_offset(u, gps_to_write);
++	if (ret) {
++		dev_err(u->dev, "flush failed: %d\n", ret);
++		return ret;
++	}
++
++	mutex_lock(&u->lock);
++	/* Only clear dirty if the flushed value still matches; a racing
++	 * write may have re-dirtied the cache in the meantime. */
++	if (u->cached_gps == gps_to_write)
++		u->dirty = false;
++	mutex_unlock(&u->lock);
++
++	dev_info(u->dev, "flushed offset_gps=0x%08x\n", gps_to_write);
++	return 0;
++}
++
++static int uefirtc_nvmem_read(void *priv, unsigned int off, void *val,
++			      size_t bytes)
++{
++	struct uefirtc *u = priv;
++	u32 gps;
++	__le32 unix_le;
++	int ret = 0;
++
++	if (off + bytes > 4)
++		return -EINVAL;
++
++	mutex_lock(&u->lock);
++	if (u->cached_valid) {
++		gps = u->cached_gps;
++	} else {
++		ret = uefirtc_disk_read_offset(u, &gps);
++		if (!ret) {
++			u->cached_gps = gps;
++			u->cached_valid = true;
++		}
++	}
++	mutex_unlock(&u->lock);
++
++	if (ret)
++		return ret;
++
++	unix_le = cpu_to_le32(gps + UEFIRTC_GPS_EPOCH);
++	memcpy(val, ((u8 *)&unix_le) + off, bytes);
++	return 0;
++}
++
++static int uefirtc_nvmem_write(void *priv, unsigned int off, void *val,
++			       size_t bytes)
++{
++	struct uefirtc *u = priv;
++	u32 new_gps;
++	__le32 unix_le;
++	int ret = 0;
++
++	if (off + bytes > 4)
++		return -EINVAL;
++
++	mutex_lock(&u->lock);
++
++	/* Seed cache from disk on first write so partial writes merge
++	 * against the real current value rather than zeros. */
++	if (!u->cached_valid) {
++		ret = uefirtc_disk_read_offset(u, &u->cached_gps);
++		if (ret)
++			goto out_unlock;
++		u->cached_valid = true;
++	}
++
++	/* Merge caller bytes onto the current (unix) representation. */
++	unix_le = cpu_to_le32(u->cached_gps + UEFIRTC_GPS_EPOCH);
++	memcpy(((u8 *)&unix_le) + off, val, bytes);
++	new_gps = le32_to_cpu(unix_le) - UEFIRTC_GPS_EPOCH;
++
++	/* Debounce: skip if unchanged.  NTP typically issues sub-second
++	 * corrections; since we store seconds, most of them are no-ops. */
++	if (new_gps == u->cached_gps)
++		goto out_unlock;
++
++	u->cached_gps = new_gps;
++	u->dirty = true;
++	dev_dbg(u->dev,
++		"cached new offset_gps=0x%08x (deferred flush)\n", new_gps);
++
++out_unlock:
++	mutex_unlock(&u->lock);
++	return ret;
++}
++
++static int uefirtc_reboot_notify(struct notifier_block *nb,
++				 unsigned long action, void *data)
++{
++	struct uefirtc *u = container_of(nb, struct uefirtc, reboot_nb);
++
++	uefirtc_flush(u);
++	return NOTIFY_DONE;
++}
++
++static int uefirtc_pm_notify(struct notifier_block *nb,
++			     unsigned long action, void *data)
++{
++	struct uefirtc *u = container_of(nb, struct uefirtc, pm_nb);
++
++	if (action == PM_SUSPEND_PREPARE || action == PM_HIBERNATION_PREPARE)
++		uefirtc_flush(u);
++	return NOTIFY_DONE;
++}
++
++static void uefirtc_unregister_reboot(void *data)
++{
++	struct uefirtc *u = data;
++
++	unregister_reboot_notifier(&u->reboot_nb);
++}
++
++static void uefirtc_unregister_pm(void *data)
++{
++	struct uefirtc *u = data;
++
++	unregister_pm_notifier(&u->pm_nb);
++}
++
++static void uefirtc_final_flush(void *data)
++{
++	struct uefirtc *u = data;
++
++	uefirtc_flush(u);
++}
++
++static int uefirtc_probe(struct platform_device *pdev)
++{
++	struct uefirtc *u;
++	struct nvmem_config cfg = {};
++	struct file *test_f;
++	const char *path;
++	int ret;
++
++	u = devm_kzalloc(&pdev->dev, sizeof(*u), GFP_KERNEL);
++	if (!u)
++		return -ENOMEM;
++
++	u->dev = &pdev->dev;
++	mutex_init(&u->lock);
++
++	ret = of_property_read_string(pdev->dev.of_node, "partition-path",
++				      &path);
++	if (ret)
++		path = "/dev/disk/by-partlabel/uefivarstore";
++	u->part_path = path;
++
++	/* Verify the block device is accessible; defer if not yet enumerated.
++	 * Kernel probe order: UFS host -> partition scan -> udev populates the
++	 * by-partlabel symlink.  We defer until all three complete. */
++	test_f = uefirtc_open(u, BLK_OPEN_READ);
++	if (IS_ERR(test_f)) {
++		ret = PTR_ERR(test_f);
++		if (ret == -ENOENT || ret == -ENODEV || ret == -EBUSY)
++			return -EPROBE_DEFER;
++		dev_err(u->dev, "cannot open %s: %d\n", path, ret);
++		return ret;
++	}
++	fput(test_f);
++
++	cfg.dev		= &pdev->dev;
++	cfg.name	= "qcom-uefirtc";
++	cfg.type	= NVMEM_TYPE_UNKNOWN;
++	cfg.size	= 4;
++	cfg.word_size	= 1;
++	cfg.stride	= 1;
++	cfg.reg_read	= uefirtc_nvmem_read;
++	cfg.reg_write	= uefirtc_nvmem_write;
++	cfg.priv	= u;
++	/*
++	 * Auto-register cells declared as child nodes of the provider in
++	 * device tree (legacy OF syntax).  rtc-pm8xxx looks up the "offset"
++	 * cell via its consumer-side nvmem-cells/nvmem-cell-names binding,
++	 * which resolves to our uefirtc-offset child node.
++	 */
++	cfg.add_legacy_fixed_of_cells = true;
++
++	u->nvmem = devm_nvmem_register(&pdev->dev, &cfg);
++	if (IS_ERR(u->nvmem))
++		return PTR_ERR(u->nvmem);
++
++	/* Register reboot + PM notifiers so cached writes flush to NAND on
++	 * power events.  devm actions run LIFO on release, so registering
++	 * the final-flush action LAST makes it run FIRST at unbind — before
++	 * the notifier unregisters and before nvmem is torn down. */
++	u->reboot_nb.notifier_call = uefirtc_reboot_notify;
++	ret = register_reboot_notifier(&u->reboot_nb);
++	if (ret) {
++		dev_err(u->dev, "register_reboot_notifier: %d\n", ret);
++		return ret;
++	}
++	ret = devm_add_action_or_reset(&pdev->dev,
++				       uefirtc_unregister_reboot, u);
++	if (ret)
++		return ret;
++
++	u->pm_nb.notifier_call = uefirtc_pm_notify;
++	ret = register_pm_notifier(&u->pm_nb);
++	if (ret) {
++		dev_err(u->dev, "register_pm_notifier: %d\n", ret);
++		return ret;
++	}
++	ret = devm_add_action_or_reset(&pdev->dev,
++				       uefirtc_unregister_pm, u);
++	if (ret)
++		return ret;
++
++	ret = devm_add_action_or_reset(&pdev->dev, uefirtc_final_flush, u);
++	if (ret)
++		return ret;
++
++	dev_info(u->dev,
++		 "nvmem provider registered for %s (deferred-write policy)\n",
++		 path);
++	return 0;
++}
++
++static const struct of_device_id uefirtc_of_match[] = {
++	{ .compatible = "qcom,uefirtc-nvmem" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, uefirtc_of_match);
++
++static struct platform_driver uefirtc_driver = {
++	.probe	= uefirtc_probe,
++	.driver	= {
++		.name		= "qcom-uefirtc",
++		.of_match_table	= uefirtc_of_match,
++	},
++};
++module_platform_driver(uefirtc_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Qualcomm UEFI variable store RTC nvmem provider");
++MODULE_AUTHOR("ROCKNIX");
+
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi
+@@ -1235,3 +1235,25 @@
+ 
+ 	status = "okay";
+ };
++
++/*
++ * RTC offset backing via the uefivarstore partition. The nvmem provider
++ * is qcom-uefirtc, which reads/writes the RTCInfo UEFI variable directly
++ * from the block device. Shared with Android.
++ */
++/ {
++	uefirtc: uefirtc-nvmem {
++		compatible = "qcom,uefirtc-nvmem";
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		uefirtc_offset: uefirtc-offset {
++			reg = <0x0 0x4>;
++		};
++	};
++};
++
++&pmk8550_rtc {
++	nvmem-cells = <&uefirtc_offset>;
++	nvmem-cell-names = "offset";
++};
