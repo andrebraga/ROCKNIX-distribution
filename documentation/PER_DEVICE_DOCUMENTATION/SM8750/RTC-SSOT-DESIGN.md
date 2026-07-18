@@ -133,6 +133,88 @@ bet worked out in §3.6 and §3.8.
 
 The rest of this document is about how we made that idea safe.
 
+### 2.4 The correct long-term path: kernel-side QSEECOM app loader
+
+**Approach.** Port the trustlet-load path from Qualcomm's downstream
+`drivers/misc/qseecom.c` into mainline (or as a ROCKNIX kernel patch)
+so the kernel can load `uefisecapp` from its on-disk partition into
+TrustZone at boot.  Once loaded, mainline
+`drivers/firmware/qcom/qcom_qseecom_uefisecapp.c` picks it up via
+`qcom_scm_qseecom_app_get_id("qcom.tz.uefisecapp")`, `RTCInfo` is
+served through proper UEFI variable services, and everything in
+§2.3 — this driver, this document's HMAC RE, the DStr/VAR2 layout
+constants, the COW alternation logic — becomes obsolete.
+
+**Provenance.** Trustlet loading works on this hardware every boot on
+Android; downstream `qseecom` does exactly this from userspace via
+`/dev/qseecom` after Linux is fully up.  Earlier framings in this
+document (§2.2, §7) suggested the SCM `APP_MGR` window closes
+post-boot — that was based on a malformed SCM call from a parked
+sketch, not a hardware limitation.  The Android reference is the
+proof.
+
+**Reference source (canonical):**
+
+  - `git.codelinaro.org/clo/la/kernel_platform` — Qualcomm's current
+    downstream superproject.  Kernel sources at `msm-kernel/`.
+    File: `msm-kernel/drivers/misc/qseecom.c`.  Release branches
+    named `kernel.lnx.<kver>.r<N>-rel`; match `N` to this device's
+    firmware release (Odin 3 trustlet reports `uefi.lnx.5.0.r39-rel`,
+    so pair with `kernel.lnx.6.6.r39-rel` or nearest).  Access
+    requires accepting Qualcomm's license terms.
+
+  - `git.codelinaro.org/clo/la/kernel/msm-5.15` and older — public
+    without license wall.  Path: `drivers/misc/qseecom.c`.  API
+    surface is older but the load-app SMC sequence is stable across
+    kernel versions.
+
+  - GitHub OEM GPL-compliance mirrors of `kernel_platform` are
+    widely available for cross-reference (Xiaomi, Samsung, OnePlus,
+    Nubia, etc. all publish forks).
+
+**Concrete work item.**  The load-app code in downstream lives in
+`__qseecom_load_fw()` at approximately `qseecom.c:4749`.  It:
+
+  1. Calls `__qseecom_get_fw_size(appname, ...)` to parse the `.mdt`
+     metadata for the trustlet blob.
+  2. Loads `cmnlib` / `cmnlib64` first if not already resident
+     (prerequisite for any other trustlet).
+  3. Allocates a DMA-coherent buffer via `__qseecom_alloc_coherent_buf()`.
+  4. Reads the MBN / `bXX` blob into that buffer.
+  5. Fills a `qseecom_load_app_ireq` / `qseecom_load_app_64bit_ireq`
+     with `qsee_cmd_id = QSEOS_APP_START_COMMAND` plus app name +
+     phys addr + sizes.
+  6. Calls `qseecom_scm_call2()` → `qcom_scm_qseecom_call()` with
+     that request.  The `qcom_scm_qseecom_call` symbol already exists
+     in mainline — the loader-side work is the SMC ID definitions,
+     the request struct layout, the DMA buffer allocation, the
+     `cmnlib` bootstrap, and the partition-read code.  Not a
+     greenfield project.
+
+Direct dependencies pulled from downstream: `linux/qseecom.h`,
+`soc/qcom/qseecom_scm.h`, `soc/qcom/qseecomi.h`, `misc/qseecom_kernel.h`,
+`qtee_shmbridge` (or `dma_alloc_coherent`).  Downstream driver
+`__qseecom_load_fw` is ~200 lines; total ported minimal loader is
+plausibly 500-1500 lines including headers, buffer management, and
+mainline coding-style adaptation.
+
+**Estimated scope.** Not a session-scale task.  Real work: study the
+downstream `__qseecom_load_fw` + `qseecom_scm_call2` in depth, port
+the SMC ID table, port or reimplement the coherent-buffer allocation
+against mainline `dma_alloc_coherent`, wire up an mdt parser, add a
+platform driver that loads `uefisecapp` at boot from
+`/dev/disk/by-partlabel/uefisecapp_a`.  Followed by upstream review
+(security-conscious, months), or ship it as a ROCKNIX-only patch
+first and let mainline follow later if it wants.
+
+**Cross-device benefit.**  Every ROCKNIX Snapdragon target
+(SM6115, SM8250, SM8550, SM8650, SM8750) hits the same TZ-locked-RTC
++ offset-in-uefivarstore problem.  A kernel-side loader fixes all of
+them.  This driver only fixes SM8750.
+
+**Status.**  Not started.  This §2.4 is the placeholder for the
+work item; the current shipping solution is §2.3.
+
 ---
 
 ## 3. Reverse-engineering `uefivarstore`
@@ -968,9 +1050,11 @@ static-analysis inference is wrong, or if a future trustlet firmware
 update tightens HMAC=0 handling, our writes would be discarded on
 next Android boot and Android would fall back to whatever we last
 persisted through its own path. The Linux read/write side keeps
-working either way. Mitigation for tighter HMAC handling would be to
-switch to the qseecom trustlet path from §2.2, which requires the
-QSEE app loader work.
+working either way. Mitigation for tighter HMAC handling — and the
+correct long-term architecture regardless — is porting the QSEE app
+loader from downstream (§2.4).  Once uefisecapp is resident, mainline
+`qcom_qseecom_uefisecapp` handles RTCInfo natively and this whole
+HMAC-handling path becomes dead code.
 
 **2. Slot mirror rewrites are not atomic across UFS.** A single
 `kernel_write` of 0x80000 bytes goes through blk-mq as one submission,
@@ -996,8 +1080,11 @@ approximately once per reboot in the worst NTP-drift case, i.e.
 
 **5. Documentation of the RTCInfo layout in mainline.** The
 qcom_qseecom_uefisecapp path already parses `struct qcom_rtc_info`
-upstream — same layout as we decoded here. This driver is intentionally
-a peer of that path, not a replacement.
+upstream — same layout as we decoded here.  This driver is a bridge
+that routes around the missing kernel-side QSEECOM app loader (§2.4)
+by reading/writing the same bytes via block I/O; it is not a
+long-term peer of the upstream path.  When the loader lands, the
+bridge is deleted.
 
 ---
 
