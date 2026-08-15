@@ -33,6 +33,13 @@
       TARGET_SUBARCH=aarch64
       TARGET_VARIANT=armv9.2-a
       ;;
+    oryon-1)
+      # Qualcomm Oryon, Armv8.7-A base (no SVE/SME).
+      # CPU flags confirm FEAT_AFP (afp), FEAT_RPRES (rpres),
+      # FEAT_ECV (ecv) — all ARMv8.7 indicators.
+      TARGET_SUBARCH=aarch64
+      TARGET_VARIANT=armv8.7-a
+      ;;
   esac
 
   TARGET_GCC_ARCH=${TARGET_SUBARCH/-}

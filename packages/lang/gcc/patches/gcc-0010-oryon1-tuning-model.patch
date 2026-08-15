@@ -1,0 +1,186 @@
+Add a dedicated Qualcomm Oryon-1 (SM8750) cost/tuning model to GCC 16.
+Derived from the GCC 15 oryon1 model, re-based onto GCC 16.1: keeps the
+cortexa57 scheduler automaton, retargets only the cost model to oryon1,
+and adds the new tune_params dispatch_constraints trailing field. RPRES
+is omitted (not present in GCC 16's aarch64 extensions).
+
+diff --git a/gcc/config/aarch64/aarch64.cc b/gcc/config/aarch64/aarch64.cc
+--- a/gcc/config/aarch64/aarch64.cc
++++ b/gcc/config/aarch64/aarch64.cc
+@@ -418,6 +418,7 @@
+ #include "tuning_models/cortexa72.h"
+ #include "tuning_models/cortexa73.h"
+ #include "tuning_models/cortexx925.h"
++#include "tuning_models/oryon1.h"
+ #include "tuning_models/exynosm1.h"
+ #include "tuning_models/thunderxt88.h"
+ #include "tuning_models/thunderx.h"
+diff --git a/gcc/config/aarch64/aarch64-cores.def b/gcc/config/aarch64/aarch64-cores.def
+--- a/gcc/config/aarch64/aarch64-cores.def
++++ b/gcc/config/aarch64/aarch64-cores.def
+@@ -158,7 +158,7 @@
+ /* ARMv8.6-A Architecture Processors.  */
+ 
+ /* Qualcomm ('Q') cores. */
+-AARCH64_CORE("oryon-1", oryon1, cortexa57, V8_6A, (CRYPTO, SM4, SHA3, F16), cortexa72,   0x51, 0x001, -1)
++AARCH64_CORE("oryon-1", oryon1, cortexa57, V8_6A, (CRYPTO, SM4, SHA3, F16), oryon1,   0x51, 0x001, -1)
+ 
+ /* ARMv8-A big.LITTLE implementations.  */
+ 
+diff --git a/gcc/config/aarch64/tuning_models/oryon1.h b/gcc/config/aarch64/tuning_models/oryon1.h
+new file mode 100644
+--- /dev/null
++++ b/gcc/config/aarch64/tuning_models/oryon1.h
+@@ -0,0 +1,152 @@
++/* Tuning model description for AArch64 architecture.
++   Copyright (C) 2009-2025 Free Software Foundation, Inc.
++
++   This file is part of GCC.
++
++   GCC is free software; you can redistribute it and/or modify it
++   under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3, or (at your option)
++   any later version.
++
++   GCC is distributed in the hope that it will be useful, but WITHOUT
++   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++   or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
++   License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with GCC; see the file COPYING3.  If not see
++   <http://www.gnu.org/licenses/>.  */
++
++/* Qualcomm Oryon-1 (SM8750). Pipeline derived from LLVM
++   AArch64SchedOryon.td:
++
++   - 14-wide issue, 376-entry ROB
++   - IXU: 6 ALU ports P0-P5 (120-entry scheduler)
++   - LSU: 4 load P6-P9 (64-entry), 2 store STD0/STD1 (64-entry)
++   - VXU: 4 FP/SIMD P12-P15 (192-entry scheduler)
++   - Load-to-use 4 cycles, store 1 cycle
++   - I2V 4 cycles, V2I 3 cycles, V2V 2 cycles
++   - FP/SIMD: add 2-3, mul 3, fma 4-6, div 10-13, sqrt 10-13
++   - Integer: add 1, mul 3, div (32b 7, 64b 9)
++   - No SVE / SME / MTE / MOPS / CSSC / LSE128 / GCS.  */
++
++#ifndef GCC_AARCH64_H_ORYON1
++#define GCC_AARCH64_H_ORYON1
++
++#include "generic.h"
++
++static const struct cpu_regmove_cost oryon1_regmove_cost =
++{
++  1, /* GP2GP  */
++  4, /* GP2FP - I2V path 4 cycles */
++  3, /* FP2GP - V2I path 3 cycles */
++  2  /* FP2FP - V2V path 2 cycles */
++};
++
++static const advsimd_vec_cost oryon1_advsimd_vector_cost =
++{
++  2, /* int_stmt_cost  */
++  2, /* fp_stmt_cost  */
++  2, /* ld2_st2_permute_cost */
++  2, /* ld3_st3_permute_cost  */
++  3, /* ld4_st4_permute_cost  */
++  2, /* permute_cost  */
++  4, /* reduc_i8_cost  */
++  4, /* reduc_i16_cost  */
++  2, /* reduc_i32_cost  */
++  2, /* reduc_i64_cost  */
++  6, /* reduc_f16_cost  */
++  4, /* reduc_f32_cost  */
++  2, /* reduc_f64_cost  */
++  2, /* store_elt_extra_cost  */
++  8, /* vec_to_scalar_cost  */
++  4, /* scalar_to_vec_cost  */
++  4, /* align_load_cost - 4-cycle LD */
++  4, /* unalign_load_cost  */
++  1, /* unalign_store_cost - 1-cycle ST */
++  1  /* store_cost  */
++};
++
++static const aarch64_base_vec_issue_info oryon1_base_issue_info =
++{
++  4, /* loads_stores_per_cycle - 4 LD ports P6-P9 */
++  2, /* stores_per_cycle - 2 STD ports STD0/STD1 */
++  6, /* general_ops_per_cycle - 6 ALU ports P0-P5 */
++  0, /* fp_simd_load_general_ops  */
++  1  /* fp_simd_store_general_ops  */
++};
++
++static const aarch64_simd_vec_issue_info oryon1_simd_issue_info =
++{
++  {
++    4, /* loads_stores_per_cycle */
++    2, /* stores_per_cycle */
++    6, /* general_ops_per_cycle */
++    0, /* fp_simd_load_general_ops */
++    1  /* fp_simd_store_general_ops */
++  },
++  2, /* ld2_st2_general_ops */
++  2, /* ld3_st3_general_ops */
++  3  /* ld4_st4_general_ops */
++};
++
++static const aarch64_vec_issue_info oryon1_vec_issue_info =
++{
++  &oryon1_base_issue_info,
++  &oryon1_simd_issue_info,
++  nullptr /* sve - Oryon-1 has no SVE */
++};
++
++static const struct cpu_vector_cost oryon1_vector_cost =
++{
++  1, /* scalar_int_stmt_cost  */
++  2, /* scalar_fp_stmt_cost  */
++  4, /* scalar_load_cost  */
++  1, /* scalar_store_cost  */
++  1, /* cond_taken_branch_cost  */
++  1, /* cond_not_taken_branch_cost  */
++  &oryon1_advsimd_vector_cost, /* advsimd  */
++  nullptr, /* sve - no SVE */
++  &oryon1_vec_issue_info
++};
++
++static const struct tune_params oryon1_tunings =
++{
++  &cortexa76_extra_costs,
++  &generic_armv9_a_addrcost_table,
++  &oryon1_regmove_cost,
++  &oryon1_vector_cost,
++  &generic_branch_cost,
++  &generic_approx_modes,
++  SVE_NOT_IMPLEMENTED, /* sve_width */
++  { 4, /* load_int - 4-cycle LD-to-use */
++    1, /* store_int - 1-cycle ST */
++    5, /* load_fp - 4 LD + 1 I2V */
++    1, /* store_fp */
++    5, /* load_pred */
++    2  /* store_pred */
++  }, /* memmov_cost. */
++  8, /* issue_rate - 14-wide, GCC saturates at ~8 */
++  AARCH64_FUSE_BASE, /* fusible_ops */
++  "32:16",	/* function_align - 32B icache */
++  "4",		/* jump_align */
++  "32:16",	/* loop_align */
++  4,	/* int_reassoc_width - 6 ALU pipes */
++  4,	/* fp_reassoc_width - 4 FP pipes */
++  2,	/* fma_reassoc_width */
++  3,	/* vec_reassoc_width - 4 SIMD pipes */
++  2,	/* min_div_recip_mul_sf */
++  2,	/* min_div_recip_mul_df */
++  0,	/* max_case_values */
++  tune_params::AUTOPREFETCHER_WEAK,	/* autoprefetcher_model */
++  (AARCH64_EXTRA_TUNE_BASE
++   | AARCH64_EXTRA_TUNE_CSE_SVE_VL_CONSTANTS
++   | AARCH64_EXTRA_TUNE_MATCHED_VECTOR_THROUGHPUT
++   | AARCH64_EXTRA_TUNE_AVOID_PRED_RMW),	/* tune_flags */
++  &generic_armv9a_prefetch_tune,
++  AARCH64_LDP_STP_POLICY_ALWAYS,   /* ldp_policy_model */
++  AARCH64_LDP_STP_POLICY_ALWAYS,   /* stp_policy_model */
++  nullptr	/* dispatch_constraints.  */
++};
++
++#endif /* GCC_AARCH64_H_ORYON1 */
