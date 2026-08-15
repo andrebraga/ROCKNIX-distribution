@@ -25,7 +25,7 @@ make_host() {
   rm -rf ${PKG_BUILD}/dist
 
   INCLUDES="-I${TOOLCHAIN}/include" \
-    make BUILD_OPT=1 USE_64=1 \
+    make BUILD_OPT=1 NSS_ENABLE_WERROR=0 USE_64=1 \
     PREFIX=${TOOLCHAIN} \
     NSPR_INCLUDE_DIR=${TOOLCHAIN}/include/nspr \
     USE_SYSTEM_ZLIB=1 ZLIB_LIBS="-lz -L${TOOLCHAIN}/lib" \
@@ -57,7 +57,7 @@ make_target() {
   make ${TARGET_x86_64} clean || true
   rm -rf ${PKG_BUILD}/dist
 
-  make BUILD_OPT=1 ${TARGET_USE_64} ${TARGET_x86_64} \
+  make BUILD_OPT=1 NSS_ENABLE_WERROR=0 ${TARGET_USE_64} ${TARGET_x86_64} \
     NSS_USE_SYSTEM_SQLITE=1 \
     NSPR_INCLUDE_DIR=${SYSROOT_PREFIX}/usr/include/nspr \
     NSS_USE_SYSTEM_SQLITE=1 \
