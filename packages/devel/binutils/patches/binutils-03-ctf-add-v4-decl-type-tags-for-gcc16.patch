@@ -1,0 +1,19 @@
+Backport CTF V4 CTF_K_DECL_TAG / CTF_K_TYPE_TAG kind constants into
+binutils' include/ctf.h so the toolchain-installed header stays
+compatible with GCC 16, whose btfout.cc/ctfc.cc reference these
+kinds. binutils (through master) has not yet imported them from the
+GCC-side libctf; without this the GCC 16 build fails with
+"'CTF_K_DECL_TAG' was not declared in this scope".
+--- a/include/ctf.h
++++ b/include/ctf.h
+@@ -422,6 +422,10 @@
+ #define CTF_K_VOLATILE	11	/* ctt_type is base type.  */
+ #define CTF_K_CONST	12	/* ctt_type is base type.  */
+ #define CTF_K_RESTRICT	13	/* ctt_type is base type.  */
+ #define CTF_K_SLICE	14	/* Variant data is a ctf_slice_t.  */
++#define CTF_K_DECL_TAG	15	/* Declaration tag.  Internal use only.
++				   Not valid externally until CTF V4.  */
++#define CTF_K_TYPE_TAG	16	/* Type tag.  Internal use only.
++				   Not valid externally until CTF V4.  */
+ 
+ #define CTF_K_MAX	63	/* Maximum possible (V2) CTF_K_* value.  */

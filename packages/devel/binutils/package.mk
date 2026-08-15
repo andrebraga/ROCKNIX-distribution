@@ -28,6 +28,7 @@ PKG_CONFIGURE_OPTS_HOST="--target=${TARGET_NAME} \
                          --enable-gold \
                          --enable-ld=default \
                          --enable-lto \
+                         --disable-gprofng \
                          --disable-nls"
 
 PKG_CONFIGURE_OPTS_TARGET="--target=${TARGET_NAME} \
@@ -46,6 +47,7 @@ PKG_CONFIGURE_OPTS_TARGET="--target=${TARGET_NAME} \
                          --disable-gold \
                          --disable-ld \
                          --disable-lto \
+                         --disable-gprofng \
                          --disable-nls"
 
 post_unpack() {
