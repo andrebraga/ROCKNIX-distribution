@@ -1,0 +1,15 @@
+--- a/sysdeps/aarch64/fpu/bits/math-vector.h
++++ b/sysdeps/aarch64/fpu/bits/math-vector.h
+@@ -155,10 +155,10 @@
+ 
+-#elif __glibc_clang_prereq(8, 0)
++#elif __glibc_clang_prereq(8, 0) && defined(__ARM_NEON)
+ #  define __ADVSIMD_VEC_MATH_SUPPORTED
+ typedef __attribute__ ((__neon_vector_type__ (4))) float __f32x4_t;
+ typedef __attribute__ ((__neon_vector_type__ (2))) double __f64x2_t;
+ #endif
+-#if __GNUC_PREREQ(10, 0) || __glibc_clang_prereq(11, 0)
++#if defined(__ARM_FEATURE_SVE) && (__GNUC_PREREQ(10, 0) || __glibc_clang_prereq(11, 0))
+ #  define __SVE_VEC_MATH_SUPPORTED
+ typedef __SVFloat32_t __sv_f32_t;
+ typedef __SVFloat64_t __sv_f64_t;

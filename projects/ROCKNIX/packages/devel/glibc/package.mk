@@ -46,7 +46,8 @@ PKG_CONFIGURE_OPTS_TARGET="BASH_SHELL=/bin/sh \
                            --without-gd \
                            --disable-build-nscd \
                            --disable-nscd \
-                           --disable-timezone-tools"
+                           --disable-timezone-tools \
+                           --disable-werror"
 
 if build_with_debug; then
   PKG_CONFIGURE_OPTS_TARGET+=" --enable-debug"
@@ -61,6 +62,13 @@ post_unpack() {
 pre_configure_target() {
 # Filter out some problematic *FLAGS
   export CFLAGS=$(echo ${CFLAGS} | sed -e "s|-O.|-O3|g")
+
+  # -mcpu=oryon-1 implies no SVE, which conflicts with glibc's internal
+  # -march=armv8-a+sve for SVE-optimized mathvec routines. Replace with
+  # the equivalent arch-level flags (Oryon is armv8.7-a with crypto/SM4/
+  # i8mm/BF16; use -mtune=generic to avoid scheduling-model conflicts
+  # with glibc's hand-tuned asm).
+  export CFLAGS=$(echo ${CFLAGS} | sed -e "s|-mcpu=oryon-1|-march=armv8.7-a+crypto+sm4+i8mm+bf16 -mtune=generic|g")
 
   export CFLAGS=$(echo ${CFLAGS} | sed -e "s|-Wunused-but-set-variable||g")
   export CFLAGS="${CFLAGS} -Wno-unused-variable"
