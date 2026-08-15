@@ -9,6 +9,7 @@ PKG_URL="${PKG_SITE}/archive/${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_TARGET="toolchain cairo wayland sway pango glib mako-notify"
 PKG_LONGDESC="Meso - A lightweight notification daemon for Wayland. Works on Sway."
 PKG_TOOLCHAIN="meson"
+PKG_MESON_OPTS_TARGET="-Dwerror=false"
 
 makeinstall_target() {
   mkdir -p ${INSTALL}/usr/bin
