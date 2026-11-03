@@ -78,6 +78,12 @@ EOF
   ### Take a backup of the system configuration on shutdown
   enable_service save-sysconfig.service
 
+  ### Apply the Wi-Fi country before ath12k loads on SM8750
+  if [ "${DEVICE}" = "SM8750" ]
+  then
+    enable_service wifi-country.service
+  fi
+
   sed -i "s#@DEVICENAME@#${DEVICE}#g" ${INSTALL}/usr/config/system/configs/system.cfg
 
   ### Defaults for community builds.

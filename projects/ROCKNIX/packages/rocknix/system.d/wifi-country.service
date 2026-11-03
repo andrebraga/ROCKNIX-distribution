@@ -1,0 +1,12 @@
+[Unit]
+Description=Set the Wi-Fi country
+DefaultDependencies=no
+Before=systemd-udevd.service systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/wifi-country
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

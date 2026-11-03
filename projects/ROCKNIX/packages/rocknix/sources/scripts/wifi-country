@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+
+# Applies wifi.country before the Wi-Fi drivers load, so that drivers with
+# a self-managed regulatory domain pick it up while registering. Changing
+# the country later, while a connection is being set up, can hang the
+# ath12k firmware.
+
+COUNTRY=$(sed -n 's/^wifi\.country=//p' /storage/.config/system/configs/system.cfg 2>/dev/null | tr -d '[:space:]')
+[ -n "${COUNTRY}" ] && exec iw reg set "${COUNTRY}"
+exit 0
