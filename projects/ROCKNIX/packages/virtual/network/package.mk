@@ -7,9 +7,14 @@ PKG_VERSION=""
 PKG_LICENSE="various"
 PKG_SITE="https://libreelec.tv"
 PKG_URL=""
-PKG_DEPENDS_TARGET="toolchain iwd networkmanager netbase ethtool openssh iw wireless-regdb rsync tailscale avahi miniupnpc nss-mdns speedtest-cli"
+PKG_DEPENDS_TARGET="toolchain networkmanager netbase ethtool openssh iw wireless-regdb rsync tailscale avahi miniupnpc nss-mdns speedtest-cli"
 PKG_SECTION="virtual"
 PKG_LONGDESC="Metapackage for various packages to install network support"
+
+case "${DEVICE}" in
+  SM8750) PKG_DEPENDS_TARGET="${PKG_DEPENDS_TARGET} wpa_supplicant" ;;
+  *)      PKG_DEPENDS_TARGET="${PKG_DEPENDS_TARGET} iwd" ;;
+esac
 
 if [ "${BLUETOOTH_SUPPORT}" = "yes" ]; then
   PKG_DEPENDS_TARGET="${PKG_DEPENDS_TARGET} bluez dbussy"
