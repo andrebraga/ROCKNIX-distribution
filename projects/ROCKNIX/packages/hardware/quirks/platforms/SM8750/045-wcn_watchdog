@@ -1,0 +1,68 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+
+# ath12k recovers the WCN7860 with an in-band reset only, and this firmware
+# does not survive it reliably: the download over BHI can fail, the firmware
+# can crash again within seconds of every restart (ath12k counts each one as
+# a success, so it loops), or it can stop answering WMI without crashing.
+# Removing power brings it back. Resetting the Root Port's bus does that:
+# qcom-pcie deinits and reinits the host, which powers the pwrctrl devices
+# off and on, as Qualcomm's cnss2 does on every recovery.
+
+. /etc/profile
+
+WLAN=/sys/bus/pci/devices/0000:01:00.0
+ROOT_PORT=/sys/bus/pci/devices/0000:00:00.0
+
+wcn_watchdog() {
+  local start last cycles header message seq now restart wmi_since wmi_count
+  start=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+  last=-1
+  cycles=0
+  restart=-60000000
+  wmi_since=-30000000
+  wmi_count=0
+  # A firmware crash dumps faster than this loop reads, and reading
+  # /dev/kmsg then fails with EPIPE; reopen it and skip what was seen.
+  while :
+  do
+    while IFS=';' read -r header message
+    do
+      # Continuation lines (" SUBSYSTEM=...") carry no message part.
+      [ -n "${message}" ] || continue
+      seq=${header#*,}
+      now=${seq#*,}
+      seq=${seq%%,*}
+      now=${now%%,*}
+      [ "${seq}" -le "${last}" ] && continue
+      last=${seq}
+      [ "${now}" -lt "${start}" ] && continue
+      case "${message}" in
+        *"MHI did not load image over BHI"*|*ath12k*"failed to start mhi"*) ;;
+        *"Hardware restart was requested"*)
+          # Leave a single crash to ath12k; a second within a minute is a loop.
+          [ $((now - restart)) -lt 60000000 ] || { restart=${now}; continue; } ;;
+        *ath12k*"wmi command "*" timeout"*)
+          # Each timeout takes 3 s; three within 30 s is firmware gone silent.
+          [ $((now - wmi_since)) -lt 30000000 ] || { wmi_since=${now}; wmi_count=0; }
+          wmi_count=$((wmi_count + 1))
+          [ ${wmi_count} -ge 3 ] || continue ;;
+        *) continue ;;
+      esac
+      restart=-60000000
+      wmi_since=-30000000
+      [ ${cycles} -ge 3 ] && continue
+      cycles=$((cycles + 1))
+      log $0 "WCN firmware failed to recover, power cycling it (${cycles}/3)."
+      sleep 2
+      # Unbind ath12k first; resetting under a bound driver leaves it timing
+      # out on every command while it tears down.
+      [ -e ${WLAN}/remove ] && echo 1 > ${WLAN}/remove
+      echo 1 > ${ROOT_PORT}/reset_subordinate
+      echo 1 > /sys/bus/pci/rescan
+    done < /dev/kmsg 2>/dev/null
+  done
+}
+
+[ -e ${ROOT_PORT}/reset_subordinate ] && wcn_watchdog &
