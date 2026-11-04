@@ -1,0 +1,175 @@
+From b2bf29ee103d00ba85aa5ae8dfd70f37a2791867 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Andr=C3=A9=20Braga?= <code@andrebraga.com>
+Date: Wed, 4 Nov 2026 12:13:31 +0000
+Subject: [PATCH] Idle without spinning, and release the audio device
+
+SDL2 pumps events every millisecond while joysticks are open, so the
+power saver's long SDL_WaitEventTimeout became a 1 kHz busy loop on any
+device with a gamepad attached. Wait in 40 ms steps instead, the same
+granularity the default power saver mode already uses.
+
+The audio device also stayed open forever, keeping the sound server's
+sink and the DSP behind it running. Close it when the power saver goes
+idle with nothing playing, and reopen it for the next sound or song.
+---
+ es-app/src/main.cpp          | 32 ++++++++++++++++++++++++++++++--
+ es-core/src/AudioManager.cpp | 19 +++++++++++++++++++
+ es-core/src/AudioManager.h   |  6 ++++++
+ es-core/src/Sound.cpp        |  7 +++++--
+ 4 files changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/es-app/src/main.cpp b/es-app/src/main.cpp
+index edd28e1..d8c60ae 100644
+--- a/es-app/src/main.cpp
++++ b/es-app/src/main.cpp
+@@ -18,8 +18,10 @@
+ #include "SystemData.h"
+ #include "SystemScreenSaver.h"
+ #include <SDL_events.h>
++#include <SDL_joystick.h>
+ #include <SDL_main.h>
+ #include <SDL_timer.h>
++#include <algorithm>
+ #include <iostream>
+ #include <time.h>
+ #include "LocaleES.h"
+@@ -462,6 +464,29 @@ void launchStartupGame()
+ 
+ // #include "utils/MathExpr.h"
+ 
++// While joysticks are open SDL2 pumps events every millisecond, which turns a
++// long SDL_WaitEventTimeout into a busy loop. Sleep in coarse steps instead.
++static int waitEventTimeout(SDL_Event* event, int timeout)
++{
++	if (SDL_NumJoysticks() == 0)
++		return SDL_WaitEventTimeout(event, timeout);
++
++	const int step = 40;
++	int start = SDL_GetTicks();
++
++	while (true)
++	{
++		if (SDL_PollEvent(event))
++			return 1;
++
++		int elapsed = SDL_GetTicks() - start;
++		if (timeout >= 0 && elapsed >= timeout)
++			return 0;
++
++		SDL_Delay(timeout < 0 ? step : std::min(step, timeout - elapsed));
++	}
++}
++
+ int main(int argc, char* argv[])
+ {
+ 	// Utils::MathExpr::performUnitTests();
+@@ -727,9 +752,12 @@ int main(int argc, char* argv[])
+ 		int eventResult;
+ 
+ 		if (screenSaverWait)
+-			eventResult = SDL_WaitEventTimeout(&event, screenSaverTimeout);
++			eventResult = waitEventTimeout(&event, screenSaverTimeout);
+ 		else if (ps_standby)
+-			eventResult = SDL_WaitEventTimeout(&event, PowerSaver::getTimeout());
++		{
++			AudioManager::getInstance()->suspendIfIdle();
++			eventResult = waitEventTimeout(&event, PowerSaver::getTimeout());
++		}
+ 		else
+ 			eventResult = SDL_PollEvent(&event);
+ 
+diff --git a/es-core/src/AudioManager.cpp b/es-core/src/AudioManager.cpp
+index 33ee5f9..1facefc 100644
+--- a/es-core/src/AudioManager.cpp
++++ b/es-core/src/AudioManager.cpp
+@@ -64,6 +64,7 @@ void AudioManager::init()
+ 	if (mInitialized)
+ 		return;
+ 	
++	mIdleSuspended = false;
+ 	mSongNameChanged = false;
+ 	mPlayingSystemThemeSong = "none";
+ 	std::deque<std::string> mLastPlayed;
+@@ -103,6 +104,7 @@ void AudioManager::deinit()
+ 	LOG(LogDebug) << "AudioManager::deinit";
+ 
+ 	mInitialized = false;
++	mIdleSuspended = false;
+ 
+ 	//stop all playback
+ 	stop();
+@@ -122,6 +124,21 @@ void AudioManager::deinit()
+ 	LOG(LogInfo) << "SDL AUDIO Deinitialized";
+ }
+ 
++void AudioManager::suspendIfIdle()
++{
++	if (!mInitialized || mCurrentMusic != nullptr || mVideoPlaying || Mix_Playing(-1) > 0)
++		return;
++
++	deinit();
++	mIdleSuspended = true;
++}
++
++void AudioManager::resumeIfSuspended()
++{
++	if (mIdleSuspended)
++		init();
++}
++
+ void AudioManager::registerSound(std::shared_ptr<Sound> & sound)
+ {
+ 	getInstance();
+@@ -403,6 +420,8 @@ static std::string decode_text_frame(const ID3v2_TextFrameData* data)
+ 
+ void AudioManager::playMusic(const std::string& path)
+ {
++	resumeIfSuspended();
++
+ 	if (!mInitialized)
+ 		return;
+ 
+diff --git a/es-core/src/AudioManager.h b/es-core/src/AudioManager.h
+index 0e5e448..00e6654 100644
+--- a/es-core/src/AudioManager.h
++++ b/es-core/src/AudioManager.h
+@@ -70,6 +70,11 @@ public:
+ 	static void setVideoPlaying(bool state);
+ 	static void update(int deltaTime);
+ 
++	// Closes the audio device while nothing plays, so the sound server can
++	// suspend the sink. Playing a sound or music reopens it.
++	void suspendIfIdle();
++	void resumeIfSuspended();
++
+ 	static int getMaxMusicVolume();
+ 
+ 	//  New function to get the full path of the currently playing song
+@@ -81,6 +86,7 @@ private:
+ 	bool songWasPlayedRecently(const std::string& song);
+ 
+ 	bool mSongNameChanged;
++	bool mIdleSuspended = false;
+ };
+ 
+ #endif // ES_CORE_AUDIO_MANAGER_H
+diff --git a/es-core/src/Sound.cpp b/es-core/src/Sound.cpp
+index 5c6abc9..fc6e8e6 100644
+--- a/es-core/src/Sound.cpp
++++ b/es-core/src/Sound.cpp
+@@ -91,10 +91,13 @@ void Sound::deinit()
+ 
+ void Sound::play()
+ {
+-	if (mSampleData == nullptr)
++	if (!Settings::getInstance()->getBool("EnableSounds"))
+ 		return;
+ 
+-	if (!Settings::getInstance()->getBool("EnableSounds"))
++	if (!AudioManager::isInitialized())
++		AudioManager::getInstance()->resumeIfSuspended();
++
++	if (mSampleData == nullptr)
+ 		return;
+ 
+ 	mPlayingChannel = Mix_PlayChannel(-1, mSampleData, 0);
