@@ -68,6 +68,9 @@ post_makeinstall_target() {
 
   mkdir -p ${INSTALL}/etc/NetworkManager/conf.d
   cp -P ${PKG_DIR}/config/NetworkManager.conf ${INSTALL}/etc/NetworkManager/NetworkManager.conf
+  case "${DEVICE}" in
+    SM8750) sed -i 's/^wifi.backend=iwd$/wifi.backend=wpa_supplicant/' ${INSTALL}/etc/NetworkManager/NetworkManager.conf ;;
+  esac
 
   mkdir -p ${INSTALL}/etc/dbus-1/system.d
   cp -P ${PKG_DIR}/dbus.d/org.freedesktop.NetworkManager.conf ${INSTALL}/etc/dbus-1/system.d/
