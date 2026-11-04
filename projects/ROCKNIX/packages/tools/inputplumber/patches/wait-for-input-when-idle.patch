@@ -1,0 +1,322 @@
+From b0034b1fd56542602f34752c4d17249819cbe9f3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Andr=C3=A9=20Braga?= <code@andrebraga.com>
+Date: Wed, 4 Nov 2026 11:59:12 +0000
+Subject: [PATCH] fix(Source Device): wait for input instead of polling when
+ idle
+
+Every evdev source slept up to 2.5 ms between non-blocking reads, and
+every target device ticked every 4-8 ms to look for output events, so
+an idle handheld woke InputPlumber over a thousand times a second.
+
+Sources with a pollable fd now wait for it to become readable: input
+wakes the loop at once, and after a second without events the wait
+stretches to 100 ms so queued output commands are still serviced.
+Target devices keep their poll rate while active and fall back to
+100 ms after a second without commands, output or scheduled events.
+---
+ Cargo.toml                            |  2 +-
+ src/input/event/evdev/translator.rs   |  5 +++
+ src/input/source/evdev/gamepad.rs     | 10 +++++-
+ src/input/source/evdev/keyboard.rs    | 10 +++++-
+ src/input/source/evdev/touchscreen.rs | 10 +++++-
+ src/input/source/mod.rs               | 48 +++++++++++++++++++++++++--
+ src/input/target/mod.rs               | 27 +++++++++++++--
+ 7 files changed, 103 insertions(+), 9 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 9e41931..af38e59 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -128,7 +128,7 @@ log = { version = "0.4.29", features = [
+   "release_max_level_debug",
+ ] }
+ mio = { version = "1.1.1", features = ["os-poll", "os-ext", "net"] }
+-nix = { version = "0.30.1", features = ["fs"] }
++nix = { version = "0.30.1", features = ["fs", "poll"] }
+ packed_struct = "0.10.1"
+ procfs = "0.18.0"
+ ratatui = "0.30.0"
+diff --git a/src/input/event/evdev/translator.rs b/src/input/event/evdev/translator.rs
+index c48c939..8220e21 100644
+--- a/src/input/event/evdev/translator.rs
++++ b/src/input/event/evdev/translator.rs
+@@ -154,6 +154,11 @@ impl EventTranslator {
+         self.translatable_events.contains(&event_signature)
+     }
+ 
++    /// Whether any events are scheduled
++    pub fn has_scheduled(&self) -> bool {
++        !self.scheduled_events.is_empty()
++    }
++
+     /// Poll for scheduled events
+     pub fn poll(&mut self) -> Vec<NativeEvent> {
+         let mut ready_events = vec![];
+diff --git a/src/input/source/evdev/gamepad.rs b/src/input/source/evdev/gamepad.rs
+index 5f5b0e6..fd50598 100644
+--- a/src/input/source/evdev/gamepad.rs
++++ b/src/input/source/evdev/gamepad.rs
+@@ -1,5 +1,5 @@
+ use std::fmt::Debug;
+-use std::os::fd::AsFd;
++use std::os::fd::{AsFd, AsRawFd, RawFd};
+ use std::{collections::HashMap, error::Error};
+ 
+ use evdev::{
+@@ -488,6 +488,14 @@ impl GamepadEventDevice {
+ }
+ 
+ impl SourceInputDevice for GamepadEventDevice {
++    fn poll_fd(&self) -> Option<RawFd> {
++        Some(self.device.as_raw_fd())
++    }
++
++    fn has_pending(&self) -> bool {
++        self.translator.as_ref().is_some_and(|t| t.has_scheduled())
++    }
++
+     /// Poll the given input device for input events
+     fn poll(&mut self) -> Result<Vec<NativeEvent>, InputError> {
+         let mut native_events = vec![];
+diff --git a/src/input/source/evdev/keyboard.rs b/src/input/source/evdev/keyboard.rs
+index abf9de5..4d048a5 100644
+--- a/src/input/source/evdev/keyboard.rs
++++ b/src/input/source/evdev/keyboard.rs
+@@ -1,5 +1,5 @@
+ use std::fmt::Debug;
+-use std::os::fd::AsFd;
++use std::os::fd::{AsFd, AsRawFd, RawFd};
+ use std::{collections::HashMap, error::Error};
+ 
+ use evdev::{Device, EventType, InputEvent};
+@@ -72,6 +72,14 @@ impl KeyboardEventDevice {
+ }
+ 
+ impl SourceInputDevice for KeyboardEventDevice {
++    fn poll_fd(&self) -> Option<RawFd> {
++        Some(self.device.as_raw_fd())
++    }
++
++    fn has_pending(&self) -> bool {
++        self.translator.as_ref().is_some_and(|t| t.has_scheduled())
++    }
++
+     /// Poll the given input device for input events
+     fn poll(&mut self) -> Result<Vec<NativeEvent>, InputError> {
+         let mut native_events = vec![];
+diff --git a/src/input/source/evdev/touchscreen.rs b/src/input/source/evdev/touchscreen.rs
+index ae8d8b5..0d73cd1 100644
+--- a/src/input/source/evdev/touchscreen.rs
++++ b/src/input/source/evdev/touchscreen.rs
+@@ -1,6 +1,6 @@
+ use std::collections::HashSet;
+ use std::fmt::Debug;
+-use std::os::fd::AsFd;
++use std::os::fd::{AsFd, AsRawFd, RawFd};
+ use std::{collections::HashMap, error::Error};
+ 
+ use evdev::{
+@@ -304,6 +304,14 @@ impl TouchscreenEventDevice {
+ }
+ 
+ impl SourceInputDevice for TouchscreenEventDevice {
++    fn poll_fd(&self) -> Option<RawFd> {
++        Some(self.device.as_raw_fd())
++    }
++
++    fn has_pending(&self) -> bool {
++        self.translator.as_ref().is_some_and(|t| t.has_scheduled())
++    }
++
+     /// Poll the given input device for input events
+     fn poll(&mut self) -> Result<Vec<NativeEvent>, InputError> {
+         let mut native_events = vec![];
+diff --git a/src/input/source/mod.rs b/src/input/source/mod.rs
+index 5844fce..dd31cec 100644
+--- a/src/input/source/mod.rs
++++ b/src/input/source/mod.rs
+@@ -2,6 +2,7 @@ use std::{
+     collections::HashSet,
+     env,
+     error::Error,
++    os::fd::{BorrowedFd, RawFd},
+     str::FromStr,
+     sync::{Arc, Mutex, MutexGuard},
+     thread,
+@@ -10,6 +11,7 @@ use std::{
+ 
+ use ::evdev::FFEffectData;
+ use led::LedDevice;
++use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+ use thiserror::Error;
+ use tokio::sync::mpsc::{self, error::TryRecvError};
+ 
+@@ -41,6 +43,11 @@ pub mod tty;
+ const BUFFER_SIZE: usize = 2048;
+ /// Default poll rate (2.5ms/400Hz)
+ const POLL_RATE: Duration = Duration::from_micros(2500);
++/// How long a source with a pollable file descriptor waits for input once it
++/// has been quiet for [IDLE_AFTER]. Output commands wait at most this long.
++const IDLE_POLL_RATE: Duration = Duration::from_millis(100);
++/// How long a source must go without events before it waits [IDLE_POLL_RATE].
++const IDLE_AFTER: Duration = Duration::from_secs(1);
+ 
+ /// Possible errors for a source device client
+ #[derive(Error, Debug)]
+@@ -126,6 +133,17 @@ pub trait SourceInputDevice {
+     fn get_default_event_filter(&self) -> Result<HashSet<Capability>, InputError> {
+         Ok(HashSet::new())
+     }
++
++    /// A file descriptor that becomes readable when the device has input. With
++    /// one, the source waits for input on it instead of sleeping between polls.
++    fn poll_fd(&self) -> Option<RawFd> {
++        None
++    }
++
++    /// Whether events are scheduled to be emitted without new input.
++    fn has_pending(&self) -> bool {
++        false
++    }
+ }
+ 
+ /// A [SourceOutputDevice] is a device implementation that can handle output events
+@@ -383,6 +401,7 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
+                 if let Err(e) = implementation.update_event_filter(event_filter.clone()) {
+                     log::error!("Failed to set default event filter for {device_id}: {e}");
+                 };
++                let mut last_event = Instant::now();
+                 loop {
+                     let poll_time_start = Instant::now();
+ 
+@@ -405,6 +424,10 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
+                         poll_span.start();
+                     }
+                     let events = implementation.poll()?;
++                    let had_events = !events.is_empty();
++                    if had_events {
++                        last_event = Instant::now();
++                    }
+                     if let Some(ref mut context) = context {
+                         let poll_span = context.metrics_mut().get_mut("source_poll").unwrap();
+                         poll_span.finish();
+@@ -458,10 +481,22 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
+                     }
+ 
+                     let poll_time = poll_time_start.elapsed();
++                    let idle = implementation.poll_fd().is_some()
++                        && !had_events
++                        && !implementation.has_pending()
++                        && last_event.elapsed() >= IDLE_AFTER;
++                    let poll_rate = if idle {
++                        IDLE_POLL_RATE
++                    } else {
++                        self.options.poll_rate
++                    };
+                     // Sleep up to the configured duration after polling timeout
+-                    if let Some(remaining) = self.options.poll_rate.checked_sub(poll_time) {
++                    if let Some(remaining) = poll_rate.checked_sub(poll_time) {
+                         log::trace!("{:?}: Sleep time remaining: {remaining:?}", device_id);
+-                        thread::sleep(remaining);
++                        match implementation.poll_fd() {
++                            Some(fd) => wait_readable(fd, remaining),
++                            None => thread::sleep(remaining),
++                        }
+                     } else {
+                         log::trace!("{:?}: Total poll time: {poll_time:?} ", device_id);
+                     }
+@@ -723,3 +758,12 @@ impl SourceDevice {
+         }
+     }
+ }
++
++/// Waits until fd is readable or the timeout passes.
++fn wait_readable(fd: RawFd, timeout: Duration) {
++    // SAFETY: the caller holds the device that owns fd for the whole wait.
++    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
++    let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
++    let millis = timeout.as_millis().clamp(1, u16::MAX as u128) as u16;
++    let _ = poll(&mut fds, PollTimeout::from(millis));
++}
+diff --git a/src/input/target/mod.rs b/src/input/target/mod.rs
+index 5f04c15..7c4dbaf 100644
+--- a/src/input/target/mod.rs
++++ b/src/input/target/mod.rs
+@@ -20,7 +20,7 @@ use std::{
+     error::Error,
+     io,
+     sync::{Arc, Mutex, MutexGuard},
+-    time::Duration,
++    time::{Duration, Instant},
+ };
+ 
+ use debug::DebugDevice;
+@@ -30,6 +30,7 @@ use thiserror::Error;
+ use tokio::{
+     sync::mpsc::{self, error::TryRecvError},
+     task::JoinHandle,
++    time::MissedTickBehavior,
+ };
+ use unified_gamepad::UnifiedGamepadDevice;
+ 
+@@ -67,6 +68,11 @@ use self::touchpad::TouchpadDevice;
+ use self::touchscreen::TouchscreenDevice;
+ use self::ultimate_2::Ultimate2WirelessDevice;
+ 
++/// How often an idle target device polls for output events.
++const IDLE_POLL_RATE: Duration = Duration::from_millis(100);
++/// How long a target device must go without activity to be idle.
++const IDLE_AFTER: Duration = Duration::from_secs(1);
++
+ /// Possible errors for a target device client
+ #[derive(Error, Debug)]
+ pub enum InputError {
+@@ -524,6 +530,10 @@ impl<T: TargetInputDevice + TargetOutputDevice + Send + 'static> TargetDriver<T>
+ 
+                 log::debug!("Target device running: {}", self.dbus.path());
+                 let mut interval = tokio::time::interval(self.options.poll_rate);
++                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++                let mut idle_interval = tokio::time::interval(IDLE_POLL_RATE);
++                idle_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++                let mut last_activity = Instant::now();
+                 loop {
+                     // Find any scheduled events that are ready to be sent
+                     let mut ready_events = vec![];
+@@ -536,6 +546,9 @@ impl<T: TargetInputDevice + TargetOutputDevice + Send + 'static> TargetDriver<T>
+                         }
+                         i += 1;
+                     }
++                    if !ready_events.is_empty() || !rx.is_empty() {
++                        last_activity = Instant::now();
++                    }
+                     for event in ready_events.drain(..) {
+                         log::trace!("Emmiting scheduled event: {event:?}");
+                         let mut implementation = self.implementation.lock().unwrap();
+@@ -580,6 +593,9 @@ impl<T: TargetInputDevice + TargetOutputDevice + Send + 'static> TargetDriver<T>
+                         };
+                         events
+                     };
++                    if !events.is_empty() {
++                        last_activity = Instant::now();
++                    }
+                     for event in events.into_iter() {
+                         let Some(ref client) = composite_device else {
+                             break;
+@@ -592,10 +608,15 @@ impl<T: TargetInputDevice + TargetOutputDevice + Send + 'static> TargetDriver<T>
+                         }
+                     }
+ 
+-                    // Sleep for the configured duration or until a command is sent
++                    // Sleep for the configured duration or until a command is sent.
++                    // After IDLE_AFTER without activity, poll at IDLE_POLL_RATE.
++                    let idle =
++                        self.scheduled_events.is_empty() && last_activity.elapsed() >= IDLE_AFTER;
+                     tokio::select! {
+-                        _ = interval.tick() => (),
++                        _ = interval.tick(), if !idle => (),
++                        _ = idle_interval.tick(), if idle => (),
+                         Some(cmd) = rx.recv() => {
++                            last_activity = Instant::now();
+                             let mut implementation = self.implementation.lock().unwrap();
+                             let result = Self::process_command(&self.type_id, &mut composite_device, &metrics_tx, &mut implementation, cmd);
+                             if let Err(e) = result {
