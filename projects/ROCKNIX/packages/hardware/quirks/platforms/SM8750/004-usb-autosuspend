@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 ROCKNIX (https://github.com/ROCKNIX)
+
+for DEV in a600000.usb 88e8000.phy; do
+  CONTROL=/sys/devices/platform/soc@0/${DEV}/power/control
+  [ -w "${CONTROL}" ] && echo auto > "${CONTROL}"
+done
+
+exit 0
