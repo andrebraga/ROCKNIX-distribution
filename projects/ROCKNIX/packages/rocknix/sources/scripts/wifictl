@@ -8,7 +8,6 @@
 # Global Environment & Dependencies
 # -----------------------------------------------------------------------------
 NMCLI=$(command -v nmcli 2>/dev/null || true)
-IWCTL=$(command -v iwctl 2>/dev/null || true)
 
 NETWORK_BASE="192.168.80"
 NETPLAY_SSID="NETPLAY_AP"
@@ -49,12 +48,12 @@ fi
 # Core Functions
 # -----------------------------------------------------------------------------
 
-# Ensures the wireless hardware is actively recognized by the iwd backend.
-# Applies regional regulatory domains if specified.
+# Waits for NetworkManager to manage the wireless device, whichever Wi-Fi
+# backend it uses. Applies regional regulatory domains if specified.
 wait_for_wifi() {
   local attempt=0
   while [[ ${attempt} -lt 5 ]]; do
-    if ${IWCTL} device list 2>/dev/null | grep -q "${WIFI_DEV}"; then
+    if ${NMCLI} -t -f DEVICE,TYPE device 2>/dev/null | grep -qx "${WIFI_DEV}:wifi"; then
       break
     fi
     sleep 1
@@ -187,7 +186,8 @@ has_ap_mode() {
   if [[ -e "${phy_path}" ]]; then
     local phy
     phy=$(basename "$(readlink "${phy_path}")")
-    if ${IWCTL} adapter "${phy}" show 2>/dev/null | grep -q 'SupportedModes.*ap'; then
+    if iw phy "${phy}" info 2>/dev/null | awk '/Supported interface modes:/ {m=1; next}
+        m && !/^\t\t \* / {exit} m && /\* AP$/ {f=1} END {exit !f}'; then
       exit 0
     fi
   fi
