@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Andr=C3=A9=20Braga?= <code@andrebraga.com>
+Date: Thu, 5 Nov 2026 00:45:00 +0000
+Subject: [PATCH] MLD STA: Set up no more links than the driver runs at once
+
+wpa_supplicant asks for a link to every usable affiliated AP of an AP
+MLD. A driver that runs fewer links at once than the AP MLD offers sets
+the others up but never activates them, and frames the AP sends on them
+are lost: with a WCN7860 (two radios) against a tri-band AP MLD, every
+three-link association timed out in the 4-way handshake.
+
+wpa_supplicant already reads the station's MLD capabilities from the
+driver. When the driver reports them and does not support EMLSR, cap the
+link set at its maximum number of simultaneous links, keeping the
+association link and the highest-frequency partners.
+---
+ wpa_supplicant/sme.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+--- a/wpa_supplicant/sme.c
++++ b/wpa_supplicant/sme.c
+@@ -882,6 +882,45 @@
+ }
+ 
+ 
++/* Set up no more links than the driver runs at once: links beyond that would
++ * be set up with the AP but never active. Keep the association link and the
++ * highest-frequency partners. A driver that reports no MLD capabilities, or
++ * supports EMLSR, gets every usable link. */
++static u16 wpas_ml_limit_links(struct wpa_supplicant *wpa_s,
++			       struct wpa_bss *bss, u16 links)
++{
++	unsigned int max_links, num_links;
++	int drop;
++	u8 i;
++
++	if (!wpa_s->mld_capa || (wpa_s->eml_capa & EHT_ML_EML_CAPA_EMLSR_SUPP))
++		return links;
++
++	max_links = (wpa_s->mld_capa & EHT_ML_MLD_CAPA_MAX_NUM_SIM_LINKS_MASK) +
++		1;
++
++	for (;;) {
++		num_links = 0;
++		drop = -1;
++		for_each_link(links, i) {
++			num_links++;
++			if (i == bss->mld_link_id)
++				continue;
++			if (drop < 0 ||
++			    bss->mld_links[i].freq < bss->mld_links[drop].freq)
++				drop = i;
++		}
++		if (num_links <= max_links || drop < 0)
++			return links;
++
++		wpa_printf(MSG_DEBUG,
++			   "MLD: Driver runs %u links at a time, not setting up link %d (%d MHz)",
++			   max_links, drop, bss->mld_links[drop].freq);
++		links &= ~BIT(drop);
++	}
++}
++
++
+ static void wpas_sme_set_mlo_links(struct wpa_supplicant *wpa_s,
+ 				   struct wpa_bss *bss, struct wpa_ssid *ssid)
+ {
+@@ -896,6 +935,7 @@
+ 	usable_links = wpa_bss_get_usable_links(wpa_s, bss, ssid, NULL);
+ 	if (!usable_links)
+ 		return;
++	usable_links = wpas_ml_limit_links(wpa_s, bss, usable_links);
+ 
+ 	os_memcpy(wpa_s->ap_mld_addr, bss->mld_addr, ETH_ALEN);
+ 	wpa_s->valid_links = 0;
