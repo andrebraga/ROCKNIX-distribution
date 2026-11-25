@@ -1,7 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Chengfeng Ye <nicoyip.dev@gmail.com>
-Date: Mon, 24 Aug 2026 21:41:49 +0800
-Subject: [PATCH] Bluetooth: hci_sync: wait for directed advertising completion
+Subject: [v5] Bluetooth: hci_sync: wait for directed advertising completion
+Link: https://lore.kernel.org/r/20260824134149.212607-1-nicoyip.dev@gmail.com
 
 le_conn_timeout is embedded in struct hci_conn, but queuing the work does
 not hold a reference to the connection.  hci_conn_del() uses
@@ -55,7 +54,6 @@ Fixes: 980ffc0a2cec ("Bluetooth: Fix LE connection timeout deadlock")
 Cc: stable@vger.kernel.org
 Suggested-by: Luiz Augusto von Dentz <luiz.dentz@gmail.com>
 Signed-off-by: Chengfeng Ye <nicoyip.dev@gmail.com>
-Link: https://lore.kernel.org/r/20260824134149.212607-1-nicoyip.dev@gmail.com
 ---
 Changes in v5:
 - Drop the generic hci_cmd_complete_evt() change from v3/v4. Keeping a
@@ -93,12 +91,12 @@ Link: https://sashiko.dev/#/patchset/20260801145430.3560911-1-nicoyip.dev%40gmai
  net/bluetooth/hci_event.c        | 33 +++++------------------
  net/bluetooth/hci_sync.c         | 38 ++++++++++++++++++++++-----
  4 files changed, 38 insertions(+), 79 deletions(-)
-
+---
 diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
-index c12cd6873f65..d7a2df82ff38 100644
+index c50182bd2..7d01f4fe9 100644
 --- a/include/net/bluetooth/hci_core.h
 +++ b/include/net/bluetooth/hci_core.h
-@@ -769,7 +769,6 @@ struct hci_conn {
+@@ -770,7 +770,6 @@ struct hci_conn {
  	struct delayed_work disc_work;
  	struct delayed_work auto_accept_work;
  	struct delayed_work idle_work;
@@ -107,10 +105,10 @@ index c12cd6873f65..d7a2df82ff38 100644
  	struct device	dev;
  	struct dentry	*debugfs;
 diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
-index 8de98af2fb58..cfcc5d055d5a 100644
+index 8f136f28b..e106caeed 100644
 --- a/net/bluetooth/hci_conn.c
 +++ b/net/bluetooth/hci_conn.c
-@@ -697,48 +697,6 @@ static void hci_conn_auto_accept(struct work_struct *work)
+@@ -705,48 +705,6 @@ static void hci_conn_auto_accept(struct work_struct *work)
  		     &conn->dst);
  }
  
@@ -159,7 +157,7 @@ index 8de98af2fb58..cfcc5d055d5a 100644
  struct iso_list_data {
  	union {
  		u8  cig;
-@@ -1131,7 +1089,6 @@ static struct hci_conn *__hci_conn_add(struct hci_dev *hdev, int type,
+@@ -1152,7 +1110,6 @@ static struct hci_conn *__hci_conn_add(struct hci_dev *hdev, int type,
  	INIT_DELAYED_WORK(&conn->disc_work, hci_conn_timeout);
  	INIT_DELAYED_WORK(&conn->auto_accept_work, hci_conn_auto_accept);
  	INIT_DELAYED_WORK(&conn->idle_work, hci_conn_idle);
@@ -167,7 +165,7 @@ index 8de98af2fb58..cfcc5d055d5a 100644
  
  	spin_lock_init(&conn->proto_lock);
  
-@@ -1279,8 +1236,6 @@ void hci_conn_del(struct hci_conn *conn)
+@@ -1300,8 +1257,6 @@ void hci_conn_del(struct hci_conn *conn)
  			hdev->acl_cnt += conn->sent;
  		break;
  	case LE_LINK:
@@ -177,10 +175,10 @@ index 8de98af2fb58..cfcc5d055d5a 100644
  			if (!hci_conn_num(hdev, LE_LINK) ||
  			    hdev->le_cnt + conn->sent > hdev->le_pkts)
 diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
-index 2f5e21ff9752..b0af5635f831 100644
+index f5c2bc773..102b639dc 100644
 --- a/net/bluetooth/hci_event.c
 +++ b/net/bluetooth/hci_event.c
-@@ -1595,22 +1595,10 @@ static u8 hci_cc_le_set_adv_enable(struct hci_dev *hdev, void *data,
+@@ -1587,22 +1587,10 @@ static u8 hci_cc_le_set_adv_enable(struct hci_dev *hdev, void *data,
  
  	hci_dev_lock(hdev);
  
@@ -205,18 +203,16 @@ index 2f5e21ff9752..b0af5635f831 100644
  
  	hci_dev_unlock(hdev);
  
-@@ -1642,20 +1630,12 @@ static u8 hci_cc_le_set_ext_adv_enable(struct hci_dev *hdev, void *data,
- 		adv = hci_find_adv_instance(hdev, set->handle);
+@@ -1664,18 +1652,10 @@ static u8 hci_cc_le_set_ext_adv_enable(struct hci_dev *hdev, void *data,
+ 	hci_dev_lock(hdev);
  
  	if (cp->enable) {
 -		struct hci_conn *conn;
 -
  		hci_dev_set_flag(hdev, HCI_LE_ADV);
  
- 		if (adv)
- 			adv->enabled = true;
- 		else if (!set->handle)
- 			hci_dev_set_flag(hdev, HCI_LE_ADV_0);
+ 		if (cp->num_of_sets)
+ 			hci_le_ext_adv_set_enabled(hdev, set->handle, true);
 -
 -		conn = hci_lookup_le_connect(hdev);
 -		if (conn)
@@ -225,8 +221,8 @@ index 2f5e21ff9752..b0af5635f831 100644
 -					   conn->conn_timeout);
  	} else {
  		if (cp->num_of_sets) {
- 			if (adv)
-@@ -1676,6 +1656,7 @@ static u8 hci_cc_le_set_ext_adv_enable(struct hci_dev *hdev, void *data,
+ 			hci_le_ext_adv_set_enabled(hdev, set->handle, false);
+@@ -1700,6 +1680,7 @@ static u8 hci_cc_le_set_ext_adv_enable(struct hci_dev *hdev, void *data,
  			list_for_each_entry_safe(adv, n, &hdev->adv_instances,
  						 list)
  				adv->enabled = false;
@@ -234,7 +230,7 @@ index 2f5e21ff9752..b0af5635f831 100644
  		}
  
  		hci_dev_clear_flag(hdev, HCI_LE_ADV);
-@@ -5764,10 +5745,12 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
+@@ -5814,10 +5795,12 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
  	hci_store_wake_reason(hdev, bdaddr, bdaddr_type);
  
  	/* Advertising stops when a connection is created. On a failed
@@ -249,7 +245,7 @@ index 2f5e21ff9752..b0af5635f831 100644
  
  	/* Check for existing connection:
  	 *
-@@ -5814,8 +5797,6 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
+@@ -5864,8 +5847,6 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
  							  &conn->init_addr_type);
  			}
  		}
@@ -259,10 +255,10 @@ index 2f5e21ff9752..b0af5635f831 100644
  
  	/* The HCI_LE_Connection_Complete event is only sent once per connection.
 diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
-index 7150037a864b..7e092e827ab8 100644
+index b86f67ea5..f949d3529 100644
 --- a/net/bluetooth/hci_sync.c
 +++ b/net/bluetooth/hci_sync.c
-@@ -6639,6 +6639,19 @@ static bool conn_use_rpa(struct hci_conn *conn)
+@@ -6776,6 +6776,19 @@ static bool conn_use_rpa(struct hci_conn *conn)
  	return hci_dev_test_flag(hdev, HCI_PRIVACY);
  }
  
@@ -282,7 +278,7 @@ index 7150037a864b..7e092e827ab8 100644
  static int hci_le_ext_directed_advertising_sync(struct hci_dev *hdev,
  						struct hci_conn *conn)
  {
-@@ -6704,7 +6717,11 @@ static int hci_le_ext_directed_advertising_sync(struct hci_dev *hdev,
+@@ -6841,7 +6854,11 @@ static int hci_le_ext_directed_advertising_sync(struct hci_dev *hdev,
  			return err;
  	}
  
@@ -295,7 +291,7 @@ index 7150037a864b..7e092e827ab8 100644
  }
  
  static int hci_le_directed_advertising_sync(struct hci_dev *hdev,
-@@ -6755,8 +6772,13 @@ static int hci_le_directed_advertising_sync(struct hci_dev *hdev,
+@@ -6892,8 +6909,13 @@ static int hci_le_directed_advertising_sync(struct hci_dev *hdev,
  
  	enable = 0x01;
  
@@ -311,7 +307,7 @@ index 7150037a864b..7e092e827ab8 100644
  }
  
  static void set_ext_conn_params(struct hci_conn *conn,
-@@ -6860,6 +6882,7 @@ static int hci_le_create_conn_sync(struct hci_dev *hdev, void *data)
+@@ -6997,6 +7019,7 @@ static int hci_le_create_conn_sync(struct hci_dev *hdev, void *data)
  		/* Pause advertising while doing directed advertising. */
  		hci_pause_advertising_sync(hdev);
  
@@ -319,7 +315,7 @@ index 7150037a864b..7e092e827ab8 100644
  		err = hci_le_directed_advertising_sync(hdev, conn);
  		goto done;
  	}
-@@ -6946,7 +6969,9 @@ static int hci_le_create_conn_sync(struct hci_dev *hdev, void *data)
+@@ -7083,7 +7106,9 @@ static int hci_le_create_conn_sync(struct hci_dev *hdev, void *data)
  done:
  	clear_bit(HCI_CONN_CREATE, &conn->flags);
  
@@ -330,8 +326,8 @@ index 7150037a864b..7e092e827ab8 100644
  		hci_le_connect_cancel_sync(hdev, conn, 0x00);
  
  	/* Re-enable advertising after the connection attempt is finished. */
-@@ -7283,9 +7308,8 @@ static void create_le_conn_complete(struct hci_dev *hdev, void *data, int err)
- 	if (conn != hci_lookup_le_connect(hdev))
+@@ -7427,9 +7452,8 @@ static void create_le_conn_complete(struct hci_dev *hdev, void *data, int err)
+ 	if (conn->state != BT_CONNECT)
  		goto unlock;
  
 -	/* Flush to make sure we send create conn cancel command if needed */

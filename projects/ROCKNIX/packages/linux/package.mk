@@ -33,10 +33,11 @@ case ${DEVICE} in
     PKG_PATCH_DIRS+=" 7.3"
     ;;
   SM8750)
-    PKG_VERSION="7.3.5"
-    PKG_SHA256="8f293f83d54f0b7b9be56863ebc5e4ea79d73e530b4ae55c572be97ef39f0990"
+    PKG_VERSION="7.3.6"
+    PKG_SHA256="8183d475a76a0faffa92d6cd500af421f589dfd0300a0f1060bb875e11d45723"
     PKG_URL="https://www.kernel.org/pub/linux/kernel/v${PKG_VERSION/.*/}.x/${PKG_NAME}-${PKG_VERSION}.tar.xz"
-    PKG_PATCH_DIRS+=" 7.3"
+    # 7.3.6 renamed btusb.c to btusb_main.c
+    PKG_PATCH_DIRS="${LINUX} mainline-7.3.6 ${DEVICE} default 7.3"
     ;;
   S922X)
     PKG_VERSION="7.3.4"

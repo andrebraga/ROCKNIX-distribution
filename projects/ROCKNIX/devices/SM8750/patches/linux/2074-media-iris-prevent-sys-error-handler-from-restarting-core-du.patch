@@ -1,7 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Fan Wu <fanwu01@zju.edu.cn>
-Date: Sun, 05 Jul 2026 03:25:29 +0000
-Subject: [PATCH] media: iris: prevent sys_error_handler from restarting core during remove
+Subject: media: iris: prevent sys_error_handler from restarting core during remove
+Link: https://lore.kernel.org/r/20260705032529.2439425-1-fanwu01@zju.edu.cn
 
 iris_remove() does not cancel the sys_error_handler delayed work, which is
 armed from the HFI response path on system errors. The handler calls
@@ -20,20 +19,19 @@ destroying the core mutex.
 Fixes: fb583a214337 ("media: iris: introduce host firmware interface with necessary hooks")
 Cc: stable@vger.kernel.org
 Signed-off-by: Fan Wu <fanwu01@zju.edu.cn>
-Link: https://lore.kernel.org/r/20260705032529.2439425-1-fanwu01@zju.edu.cn
 ---
  drivers/media/platform/qcom/iris/iris_core.c           |  5 +++++
  drivers/media/platform/qcom/iris/iris_core.h           |  4 ++++
  .../media/platform/qcom/iris/iris_hfi_gen1_response.c  |  5 +++--
  .../media/platform/qcom/iris/iris_hfi_gen2_response.c  |  5 +++--
- drivers/media/platform/qcom/iris/iris_probe.c          | 10 ++++++++++
- 5 files changed, 25 insertions(+), 4 deletions(-)
-
+ drivers/media/platform/qcom/iris/iris_probe.c          |  9 +++++++++
+ 5 files changed, 24 insertions(+), 4 deletions(-)
+---
 diff --git a/drivers/media/platform/qcom/iris/iris_core.c b/drivers/media/platform/qcom/iris/iris_core.c
-index 52bf56e517f9..b843ab0d484c 100644
+index 8c335dbfc..6ed8c5a77 100644
 --- a/drivers/media/platform/qcom/iris/iris_core.c
 +++ b/drivers/media/platform/qcom/iris/iris_core.c
-@@ -48,6 +48,11 @@ int iris_core_init(struct iris_core *core)
+@@ -54,6 +54,11 @@ int iris_core_init(struct iris_core *core)
  	int ret;
  
  	mutex_lock(&core->lock);
@@ -46,10 +44,10 @@ index 52bf56e517f9..b843ab0d484c 100644
  		ret = 0;
  		goto exit;
 diff --git a/drivers/media/platform/qcom/iris/iris_core.h b/drivers/media/platform/qcom/iris/iris_core.h
-index 24da60448cf2..a52d2a1f07c4 100644
+index 3e4cf652b..35fdaf5d2 100644
 --- a/drivers/media/platform/qcom/iris/iris_core.h
 +++ b/drivers/media/platform/qcom/iris/iris_core.h
-@@ -74,6 +74,9 @@ struct qcom_ubwc_cfg_data;
+@@ -78,6 +78,9 @@ struct qcom_ubwc_cfg_data;
   * @core_init_done: structure of signal completion for system response
   * @intr_status: interrupt status
   * @sys_error_handler: a delayed work for handling system fatal error
@@ -59,7 +57,7 @@ index 24da60448cf2..a52d2a1f07c4 100644
   * @instances: a list_head of all instances
   * @inst_fw_caps_dec: an array of supported instance capabilities by decoder
   * @inst_fw_caps_enc: an array of supported instance capabilities by encoder
-@@ -119,6 +122,7 @@ struct iris_core {
+@@ -124,6 +127,7 @@ struct iris_core {
  	struct completion			core_init_done;
  	u32					intr_status;
  	struct delayed_work			sys_error_handler;
@@ -68,7 +66,7 @@ index 24da60448cf2..a52d2a1f07c4 100644
  	/* encoder and decoder have overlapping caps, so two different arrays are required */
  	struct platform_inst_fw_cap		inst_fw_caps_dec[INST_FW_CAP_MAX];
 diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen1_response.c b/drivers/media/platform/qcom/iris/iris_hfi_gen1_response.c
-index bfd7495bf44f..c9100112d07b 100644
+index e2b95c22f..1fd4ea651 100644
 --- a/drivers/media/platform/qcom/iris/iris_hfi_gen1_response.c
 +++ b/drivers/media/platform/qcom/iris/iris_hfi_gen1_response.c
 @@ -230,9 +230,10 @@ iris_hfi_gen1_sys_event_notify(struct iris_core *core, void *packet)
@@ -85,7 +83,7 @@ index bfd7495bf44f..c9100112d07b 100644
  
  static void
 diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen2_response.c b/drivers/media/platform/qcom/iris/iris_hfi_gen2_response.c
-index 25162ae71357..7f0c121866f2 100644
+index f0782c4b1..7369a56c4 100644
 --- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_response.c
 +++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_response.c
 @@ -285,10 +285,11 @@ static int iris_hfi_gen2_handle_system_error(struct iris_core *core,
@@ -103,10 +101,10 @@ index 25162ae71357..7f0c121866f2 100644
  }
  
 diff --git a/drivers/media/platform/qcom/iris/iris_probe.c b/drivers/media/platform/qcom/iris/iris_probe.c
-index c2dcb50a2782..c8553bc7619f 100644
+index 5e5d77736..b3e2e0401 100644
 --- a/drivers/media/platform/qcom/iris/iris_probe.c
 +++ b/drivers/media/platform/qcom/iris/iris_probe.c
-@@ -200,7 +200,17 @@ static void iris_remove(struct platform_device *pdev)
+@@ -251,6 +251,15 @@ static void iris_remove(struct platform_device *pdev)
  	if (!core)
  		return;
  
@@ -119,8 +117,6 @@ index c2dcb50a2782..c8553bc7619f 100644
 +	core->unregistering = true;
 +	mutex_unlock(&core->lock);
 +
- 	iris_core_deinit(core);
-+	cancel_delayed_work_sync(&core->sys_error_handler);
+ 	cancel_delayed_work_sync(&core->sys_error_handler);
  
- 	video_unregister_device(core->vdev_dec);
- 	video_unregister_device(core->vdev_enc);
+ 	iris_core_deinit(core);
